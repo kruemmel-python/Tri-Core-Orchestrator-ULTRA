@@ -1,7 +1,13 @@
 # Tri-Core Orchestrator **ULTRA**
 
 **A (Proto/DL) + B (SubQG) + C (VQE)** – Interaktive GPU-Workbench für deinen `CipherCore_OpenCl`-Treiber
+---
+Tri-Core Orchestrator ULTRA ist ein offenes Forschungs-Framework zur Kopplung klassischer, feldbasierter und quanteninspirierter Lernprozesse auf der GPU.
+Entwickelt von Ralf Krümmel, um ein reales Verständnis von Emergenz, Energie-Optimierung und dynamischer Intelligenz sichtbar zu machen.
 
+Dieses Repository markiert den Schritt von einer proprietären Forschung zu einer offenen Plattform für experimentelle KI-Architekturen,
+die Entwickler:innen, Forscher:innen und Studierende gleichermaßen inspiriert, selbst in die Tiefe zu gehen.
+---
 [![Python](https://img.shields.io/badge/Python-3.12-blue.svg)](#)
 [![Streamlit](https://img.shields.io/badge/Streamlit-App-red.svg)](#)
 [![Platform](https://img.shields.io/badge/OS-Windows%2010%2F11-informational.svg)](#)
@@ -2122,6 +2128,7 @@ jobs:
 Damit ist **Build & Test** vollständig dokumentiert – sauber integriert mit deinem Ordner **`driver_build/`**, deiner **CI-Pipeline** und dem **realen Zustand** deiner DLL *(94 Exporte, Tests grün)*.
 
 > **Pro-Tipp:** Achte darauf, dass `st.query_params` (nicht `st.experimental_get_query_params`) verwendet wird – die App nutzt bereits die neue API und hält nur den **GPU-Index** in der URL; der **DLL-Pfad** bleibt im Session-State stabil.
+---
+MIT License © 2025 Ralf Krümmel
 
-
-
+---
