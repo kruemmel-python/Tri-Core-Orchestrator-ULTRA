@@ -9,14 +9,14 @@
 
 Eine **lokal lauffähige Streamlit-Anwendung**, die drei Rechenpfade **sichtbar koppelt**:
 
-* **A – Proto/DL:** GPU-Zuordnung ➜ segmentierte Aggregation ➜ Prototyp-Update
-* **B – SubQG:** myzelartige Feldsimulation (Batches) mit **Konfidenz-Metriken** (Mean/Std/Sigma)
-* **C – VQE:** Variational Quantum Eigensolver (SPSA) mit **frei editierbarem Pauli-Z-Hamiltonian**
+- **A – Proto/DL:** GPU-Zuordnung ➜ segmentierte Aggregation ➜ Prototyp-Update  
+- **B – SubQG:** myzelartige Feldsimulation (Batches) mit **Konfidenz-Metriken** (Mean/Std/Sigma)  
+- **C – VQE:** Variational Quantum Eigensolver (SPSA) mit **frei editierbarem Pauli-Z-Hamiltonian**
 
 Die Kopplung sorgt für **geschlossene Rückkopplungsschleifen**:
 
-* **Feld-Score →** moduliert **Lernrate** (LR) der Prototyp-Updates
-* **VQE-Energie →** moduliert **Rauschpegel** im Treiber (`set_noise_level`)
+- **Feld-Score →** moduliert **Lernrate** (LR) der Prototyp-Updates  
+- **VQE-Energie →** moduliert **Rauschpegel** im Treiber (`set_noise_level`)
 
 > **Ziel:** Eine **reproduzierbare**, **performante** und **didaktisch klare** Experimentier- und Demo-Umgebung, die klassische Lernverfahren, feldbasierte Emergenz und quanteninspirierte Optimierung **in einem UI** erlebbar macht.
 
@@ -24,34 +24,35 @@ Die Kopplung sorgt für **geschlossene Rückkopplungsschleifen**:
 
 ## Inhaltsverzeichnis
 
-* [Features](#features)
-* [Schnellstart](#schnellstart)
-* [Voraussetzungen](#voraussetzungen)
-* [Installation](#installation)
-* [Starten](#starten)
-* [Benutzung (UI-Leitfaden)](#benutzung-ui-leitfaden)
-* [Architektur](#architektur)
-* [Treiber-API (ctypes-Bindings)](#treiber-api-ctypes-bindings)
-* [Parameter & Kopplung](#parameter--kopplung)
-* [Exports & Formate](#exports--formate)
-* [Benchmarks & Auto-GPU](#benchmarks--auto-gpu)
-* [Troubleshooting](#troubleshooting)
-* [FAQ](#faq)
-* [Lizenz](#license)
-* [Zitieren](#zitieren)
+- [Features](#features)
+- [Schnellstart](#schnellstart)
+- [Voraussetzungen](#voraussetzungen)
+- [Installation](#installation)
+- [Starten](#starten)
+- [Benutzung (UI-Leitfaden)](#benutzung-ui-leitfaden)
+- [Architektur](#architektur)
+- [Testumgebung & Validierung](#testumgebung--validierung)
+- [Treiber-API (ctypes-Bindings)](#treiber-api-ctypes-bindings)
+- [Parameter & Kopplung](#parameter--kopplung)
+- [Exports & Formate](#exports--formate)
+- [Benchmarks & Auto-GPU](#benchmarks--auto-gpu)
+- [Troubleshooting](#troubleshooting)
+- [FAQ](#faq)
+- [Lizenz](#license)
+- [Zitieren](#zitieren)
 
 ---
 
 ## Features
 
-* **Tri-Core-Kopplung**: A (Proto/DL) ↔ B (SubQG) ↔ C (VQE) in einem konsistenten Ablauf pro Epoche
-* **VQE-Editor**: Hamiltonian als **JSON** (Pauli-Z-Terme: `{"z_mask": int, "c": float}`) – Validierung im UI
-* **Konfidenz-Heatmaps**: Mean/Std/Sigma aus mehreren SubQG-Samples pro Epoche
-* **PCA-Visualisierung**: Vorher/Nachher, Δ-Pfeile, **Trajektorien** einzelner Prototypen, **GIF-Export**
-* **Persistenz**: **.npz** Sitzungen (History + Epoche-Daten + Parameter) laden/speichern
-* **Robustes UI**: Ein-Epoche-Fälle ohne Streamlit-Fehler (Slider-Fallbacks, Singleton-Plots)
-* **GPU-Werkzeuge**: GPU-Liste, Micro-Benchmark, **Auto-Auswahl** der schnellsten GPU
-* **Lokaler Datenschutz**: Keine Cloud, alles offline
+- **Tri-Core-Kopplung**: A (Proto/DL) ↔ B (SubQG) ↔ C (VQE) in einem konsistenten Ablauf pro Epoche  
+- **VQE-Editor**: Hamiltonian als **JSON** (Pauli-Z-Terme: `{"z_mask": int, "c": float}`) – Validierung im UI  
+- **Konfidenz-Heatmaps**: Mean/Std/Sigma aus mehreren SubQG-Samples pro Epoche  
+- **PCA-Visualisierung**: Vorher/Nachher, Δ-Pfeile, **Trajektorien** einzelner Prototypen, **GIF-Export**  
+- **Persistenz**: **.npz**-Sitzungen (History + Epoche-Daten + Parameter) laden/speichern  
+- **Robustes UI**: Ein-Epoche-Fälle ohne Streamlit-Fehler (Slider-Fallbacks, Singleton-Plots)  
+- **GPU-Werkzeuge**: GPU-Liste, Micro-Benchmark, **Auto-Auswahl** der schnellsten GPU  
+- **Lokaler Datenschutz**: Keine Cloud, alles offline
 
 ---
 
@@ -71,7 +72,7 @@ pip install -r requirements.txt
 
 # 4) Streamlit App starten
 streamlit run streamlit_tri_core_ultra.py
-```
+````
 
 > **Hinweis (Windows-Pfad):** Lege die `CipherCore_OpenCl.dll` in deinen Projektordner oder trage den absoluten Pfad im **Sidebar-Feld „DLL-Pfad“** ein.
 > **URL-Parameter:** Der **GPU-Index** wird in der URL gehalten (`?gpu=0`). Der **DLL-Pfad** bleibt **nur** im Session-State.
@@ -87,7 +88,7 @@ streamlit run streamlit_tri_core_ultra.py
 
 **Python-Pakete (Kern):**
 
-* `streamlit`, `numpy`, `matplotlib`, `plotly`, `imageio`, `Pillow`
+`streamlit`, `numpy`, `matplotlib`, `plotly`, `imageio`, `Pillow`, `pytest` (für Tests), optional `pytest-cov`
 
 Beispiel-`requirements.txt`:
 
@@ -98,6 +99,8 @@ matplotlib>=3.9
 plotly>=5.22
 imageio>=2.34
 Pillow>=10.3
+pytest>=8.2
+pytest-cov>=5.0
 ```
 
 ---
@@ -118,7 +121,7 @@ streamlit run streamlit_tri_core_ultra.py
 
 ### 1) Einstellungen (Sidebar)
 
-* **DLL-Pfad**: Stabil nur im Session-State (kein Query-Param, robust gegen Windows-Pfadangaben)
+* **DLL-Pfad**: stabil nur im Session-State (kein Query-Param, robust gegen Windows-Pfade)
 * **GPU-Index**: Zahleneingabe; in der URL (`?gpu=N`) aktualisiert
 * **GPU-Werkzeuge**:
 
@@ -175,10 +178,8 @@ flowchart LR
         D5[VQE: execute_vqe_gpu / set_noise_level]
     end
 
-    %% safer node label (quotes)
     P["Tri-Core Pipeline / Epoch"]
 
-    %% main flow (ASCII-only edge labels)
     A1 -->|params and seeds| P
     P  -->|ctypes calls| Core
     Core -->|raw data: indices · sums · field · E| P
@@ -186,8 +187,6 @@ flowchart LR
     A2 -->|hamiltonian json| P
     A4 -->|history and epoch data| P
     P  -->|history and epoch data| A4
-
-
 ```
 
 **Ablauf pro Epoche (vereinfacht):**
@@ -197,6 +196,95 @@ flowchart LR
 3. **VQE (SPSA)** → **bestE** → `set_noise_level()` im Treiber
 4. **Zweites Update** (A4, modulierte LR)
 5. **Metriken/Plots**: Δ-L2 gesamt, Per-Proto Δ(Embedding/PCA), PCA-Vorher/Nachher, Heatmaps, VQE-Kurve
+
+---
+
+## 🧪 Testumgebung & Validierung
+
+Ziel: **Fehler früh finden**, Treiber/DLL **sicher** initialisieren, Datenpfade und Kopplungen **deterministisch** prüfen.
+
+### Env-Variablen
+
+* `CIPHERCORE_DLL` – Pfad zur `CipherCore_OpenCl.dll` (falls nicht im Projektordner)
+* `CIPHERCORE_GPU` – gewünschter GPU-Index (Standard: `0`)
+
+PowerShell-Beispiel:
+
+```powershell
+$env:CIPHERCORE_DLL="G:\Tri-Core-Orchestrator-ULTRA\build\CipherCore_OpenCl.dll"
+$env:CIPHERCORE_GPU="0"
+```
+
+### Pytest ausführen
+
+```bash
+# komplette Suite (DLL + Orchestrator)
+pytest -v
+
+# nur die UI/Orchestrator-Tests
+pytest -v tests/test_streamlit_tri_core_ultra.py
+
+# mit kurzer Zusammenfassung
+pytest -rs
+```
+
+**Beispiel-Ergebnis (Lokal):**
+
+```
+================================================= 14 passed in 17.9s ==================================================
+```
+
+### PowerShell-Runner
+
+`tests/run_tests.ps1` (nutzt obige Env-Variablen, setzt sinnvolle Defaults):
+
+```powershell
+param(
+  [string]$Dll = $env:CIPHERCORE_DLL,
+  [int]$Gpu = [int]($env:CIPHERCORE_GPU | ForEach-Object { if ($_ -ne $null) { $_ } else { 0 } })
+)
+
+if (-not $Dll) { $Dll = (Join-Path $PSScriptRoot "..\build\CipherCore_OpenCl.dll") }
+Write-Host "Using CIPHERCORE_DLL=$Dll"
+Write-Host "Using CIPHERCORE_GPU=$Gpu"
+
+$env:CIPHERCORE_DLL = $Dll
+$env:CIPHERCORE_GPU = "$Gpu"
+
+pytest -q tests/test_streamlit_tri_core_ultra.py
+```
+
+**Runner starten:**
+
+```powershell
+.\tests\run_tests.ps1
+```
+
+### Pytest-Konfiguration (optional)
+
+`pytest.ini`:
+
+```ini
+[pytest]
+addopts = -q
+testpaths = tests, .
+filterwarnings =
+    ignore::DeprecationWarning
+```
+
+### Testmatrix (Auszug)
+
+| Komponente                         | Ziel                                 | Test/Skript                              |
+| ---------------------------------- | ------------------------------------ | ---------------------------------------- |
+| DLL-Init & Kernel-Compile          | OpenCL-Kontext & Kernels ok          | `function_test.py::test_*`               |
+| Elementweise Ops / MatMul / Adam   | numerische Korrektheit               | `function_test.py`                       |
+| Quantum-Echo Varianten             | OTOC/Echo-Pfade korrekt              | `function_test.py`                       |
+| LR-Modulation & Masken             | monotone Kopplung / Bounds           | `tests/test_streamlit_tri_core_ultra.py` |
+| Assignment-Metriken                | Entropy/Coverage plausibel           | `tests/test_streamlit_tri_core_ultra.py` |
+| VQE-Param-Zählung (Ansatz)         | Parameteranzahl vs. Gates konsistent | `tests/test_streamlit_tri_core_ultra.py` |
+| Golden Snapshot / Export-Roundtrip | deterministischer Export/Import      | `tests/test_streamlit_tri_core_ultra.py` |
+
+> **Hinweis:** Die App prüft beim Start zusätzlich die GPU-Initialisierung und meldet Fehler im UI.
 
 ---
 
@@ -214,23 +302,23 @@ flowchart LR
 
 **A) Proto/DL**
 
-* `execute_dynamic_token_assignment_gpu(gpu, buf_A, buf_Te, buf_idx, B, S, E, T) -> int`
-* `execute_proto_segmented_sum_gpu(gpu, buf_Aflat, buf_idxflat, buf_ps, buf_pc, BS, E, T) -> int`
-* `execute_proto_update_step_gpu(gpu, buf_Te, buf_ps, buf_pc, lr: float, E, T) -> int`
-* `execute_shape_loss_with_reward_penalty_list_gpu(...) -> int` *(optional im UI, Binding vorhanden)*
+* `execute_dynamic_token_assignment_gpu(...) -> int`
+* `execute_proto_segmented_sum_gpu(...) -> int`
+* `execute_proto_update_step_gpu(...) -> int`
+* `execute_shape_loss_with_reward_penalty_list_gpu(...) -> int` *(optional)*
 
 **B) SubQG**
 
-* `subqg_initialize_state_batched(gpu, batch_cells, init_energy*, init_phase*, noise, thr) -> int`
-* `subqg_simulation_step_batched(gpu, rng_energy*, rng_phase*, rng_spin*, batch_cells, out_energy*, out_phase*, out_interf*, out_node*, out_spin*, out_topo*, field_map*, out_len) -> int`
+* `subqg_initialize_state_batched(...) -> int`
+* `subqg_simulation_step_batched(...) -> int`
 
 **C) VQE**
 
 * `execute_vqe_gpu(gpu, qubits, layers, theta*, theta_len, pauli_terms*, num_terms, out_E*, out_grad*) -> int`
-  *`PauliZTerm{ uint64 z_mask; float coefficient; }`*
+  `PauliZTerm{ uint64 z_mask; float coefficient; }`
 * `set_noise_level(gpu, noise: float) -> void`
 
-Alle Calls werden intern über `_chk(ok, where)` abgesichert (Fehlerrückgabe ≠1 → Exception).
+Alle Calls werden intern über `_chk(ok, where)` abgesichert (Fehlerrückgabe ≠ 1 → Exception).
 
 ---
 
@@ -282,9 +370,9 @@ Mit **Clamping**: `LR_MIN ≤ lr ≤ LR_MAX`.
   `history_delta_proto`, `history_noise_set` (NumPy-Arrays)
 * `epoch_data_json` – **Liste** je Epoche mit:
 
-  * `pca_before` `(T,2)`, `pca_after` `(T,2)`
-  * `field_map_mean`, `field_map_std` `(SUBQG_BATCH_CELLS,)`
-  * `delta_per_proto_emb` `(T,)`, `delta_per_proto_pca` `(T,)`
+  * `pca_before (T,2)`, `pca_after (T,2)`
+  * `field_map_mean`, `field_map_std (SUBQG_BATCH_CELLS,)`
+  * `delta_per_proto_emb (T,)`, `delta_per_proto_pca (T,)`
 * `params_json` – alle UI-Parameter (inkl. Hamiltonian)
 
 ### PCA-GIF
@@ -309,7 +397,7 @@ Mit **Clamping**: `LR_MIN ≤ lr ≤ LR_MAX`.
 
 **DLL lädt nicht / `Treiber-Call fehlgeschlagen`**
 
-* Pfad prüfen (absolut/relativ), DLL-Abhängigkeiten (OpenCL-Runtime), Zugriffrechte
+* Pfad prüfen (absolut/relativ), DLL-Abhängigkeiten (OpenCL-Runtime), Zugriffsrechte
 * Prüfe, ob `initialize_gpu(gpu)` auf der gewählten GPU **1** zurückgibt (sonst anderen Index wählen)
 
 **Leere/weiße Plots**
@@ -368,3 +456,6 @@ streamlit run streamlit_tri_core_ultra.py
 ```
 
 > **Pro-Tipp:** Achte darauf, dass `st.query_params` (nicht `st.experimental_get_query_params`) verwendet wird – die App nutzt bereits die neue API und hält nur den **GPU-Index** in der URL; der **DLL-Pfad** bleibt im Session-State stabil.
+
+
+
