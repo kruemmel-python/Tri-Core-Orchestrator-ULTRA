@@ -1,5 +1,5 @@
 Param(
-  [string]$DllPath = "..\build\CipherCore_OpenCl.dll"
+  [string]$DllPath = ".\build\CipherCore_OpenCl.dll"
 )
 Write-Host "[INFO] DLL:" (Resolve-Path $DllPath)
 # Prefer dumpbin if available (VS Tools)

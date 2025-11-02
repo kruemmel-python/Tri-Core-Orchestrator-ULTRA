@@ -1,0 +1,46 @@
+{
+  "composition": "X5",
+  "x": [
+    0.3241128290251244,
+    0.4466585854559678,
+    0.799103109516607,
+    0.4564784198935179,
+    0.6903633331684902,
+    0.7570190336432753,
+    0.5626928093403547,
+    0.6547935075608798
+  ],
+  "properties": {
+    "density": 5.63488299693762,
+    "conductivity": 1.0952366779614313,
+    "permittivity": 49.968417163002805,
+    "bandgap": 3.001157286040631,
+    "hardness": 6.190367541127907,
+    "thermal_conductivity": 49.968417163002805,
+    "magnetic_moment": 2.5994728233691244
+  },
+  "driver": "CipherCore_OpenCl.dll",
+  "config": {
+    "epochs": 100,
+    "pop": 96,
+    "dim": 8,
+    "strategy": "mix",
+    "lr0": 0.1,
+    "vqe_steps": 12,
+    "vqe_mode": "auto",
+    "field_p1": 12.0,
+    "field_p2": 0.35,
+    "seed": 2025,
+    "num_qubits": 4,
+    "ansatz_layers": 2,
+    "num_h_terms": 3,
+    "gpu": 1,
+    "w_tol": 0.5,
+    "w_con": 0.3,
+    "w_surr": 0.2,
+    "tol_sigma_lo": 0.05,
+    "tol_sigma_hi": 0.2,
+    "export_csv": "G:\\Tri-Core-Orchestrator-ULTRA\\runs\\topk_gpu1.csv",
+    "topk": 20
+  }
+}

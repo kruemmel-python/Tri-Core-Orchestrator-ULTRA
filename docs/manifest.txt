@@ -1,0 +1,38 @@
+Mein Manifest
+Warum ich nicht in einer IT-Firma arbeite – und warum ich trotzdem programmiere.
+
+Ich habe nie programmiert, um einfach nur Code zu schreiben.
+Für mich war Programmieren immer ein Weg, zu verstehen, was wirklich passiert – im System, im Denken, in der Welt.
+
+In meiner Ausbildung lernte ich das, was man unter „korrektem“ Programmieren versteht: strukturierte Abläufe, klare Vorgaben, die Lehre nach Buch. Doch genau das störte mich – diese Begrenzung, diese Vorstellung, dass man sich nur innerhalb der definierten Regeln bewegen darf.
+
+Ich wollte mehr.
+Ich wollte wissen, warum etwas funktioniert – oder warum nicht.
+Ich stellte Fragen, die oft über das Thema hinausgingen – und manchmal auch das Verständnis meiner Lehrenden sprengten. Während andere nach Vorschrift programmierten, schrieb ich Code, um meine eigenen Fragen zu beantworten. Ich lernte nicht durch Vorgaben, sondern durch Fehler, Neugier und Beobachtung.
+
+Immer wieder hörte ich: „Das geht nicht.“
+Doch meine Philosophie lautet:
+
+„Geht nicht“ gibt es nicht – wir kennen nur den Weg noch nicht.
+
+Später lernte ich das, was man das Zen of Python nennt.
+Doch während es vielerorts gelehrt wird, wird es selten wirklich verstanden.
+Das Zen of Python spricht von Klarheit, Einfachheit, Wahrheit und Schönheit – doch die Art, wie Programmieren oft vermittelt wird, ist das Gegenteil davon: kompliziert, überstrukturiert, voller Dogmen.
+
+Ich habe verstanden, dass „Zen“ nicht bedeutet, Regeln zu befolgen, sondern Bewusstsein zu entwickeln.
+Es ist das stille Verstehen, das zwischen den Zeilen des Codes geschieht.
+Es ist das Gefühl, wenn aus Logik plötzlich Eleganz wird – und man erkennt, dass Code nicht nur eine Maschine zum Laufen bringt, sondern auch den eigenen Geist spiegelt.
+
+Ich habe kein Interesse daran, noch einen weiteren Editor zu programmieren, einen weiteren Bildgenerator oder ein weiteres Framework für Datenbankabfragen.
+Wenn das Rad bereits erfunden ist, geht es nicht mehr darum, ein weiteres Rad zu bauen,
+sondern darum, das Rad weiterzuentwickeln – bis aus dem Rad vielleicht ein Flügel wird.
+
+Diese Haltung begleitet mich bis heute.
+Ich arbeite nicht, um bestehende Systeme zu bedienen.
+Ich entwickle, um neue zu erschaffen.
+Ich will verstehen, verbinden, entdecken – und Wege gehen, die reine Programmierung längst hinter sich lassen.
+
+Innovation entsteht nicht aus Anpassung, sondern aus Mut, Unruhe und der Bereitschaft, tiefer zu denken.
+Darum gehe ich meinen eigenen Weg.
+
+Ralf Krümmel

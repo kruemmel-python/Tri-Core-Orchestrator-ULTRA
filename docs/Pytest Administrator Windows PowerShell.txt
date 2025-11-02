@@ -1,0 +1,25 @@
+(.venv) PS G:\Tri-Core-Orchestrator-ULTRA> pytest -rs
+================================================= test session starts =================================================
+platform win32 -- Python 3.12.10, pytest-8.4.2, pluggy-1.6.0
+rootdir: G:\Tri-Core-Orchestrator-ULTRA
+configfile: pytest.ini
+testpaths: tests,, .
+collected 14 items
+
+function_test.py ........                                                                                        [ 57%]
+tests\test_streamlit_tri_core_ultra.py ......                                                                    [100%]
+
+================================================= 14 passed in 18.03s =================================================
+(.venv) PS G:\Tri-Core-Orchestrator-ULTRA> G:\Tri-Core-Orchestrator-ULTRA\tests\run_tests.ps1
+Using CIPHERCORE_DLL=G:\Tri-Core-Orchestrator-ULTRA\build\CipherCore_OpenCl.dll
+Using CIPHERCORE_GPU=0
+================================================= test session starts =================================================
+platform win32 -- Python 3.12.10, pytest-8.4.2, pluggy-1.6.0
+rootdir: G:\Tri-Core-Orchestrator-ULTRA
+configfile: pytest.ini
+collected 6 items
+
+tests\test_streamlit_tri_core_ultra.py ......                                                                    [100%]
+
+================================================== 6 passed in 0.02s ==================================================
+(.venv) PS G:\Tri-Core-Orchestrator-ULTRA>
