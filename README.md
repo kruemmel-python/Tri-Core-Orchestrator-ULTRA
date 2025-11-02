@@ -161,26 +161,33 @@ streamlit run streamlit_tri_core_ultra.py
 ```mermaid
 flowchart LR
     subgraph UI[Streamlit UI]
-      A1[Run once / epochs]
-      A2[Parameter: VQE, SubQG, LR, Hamiltonian JSON]
-      A3[Plots: VQE, PCA, Heatmaps, Metriken]
-      A4[Persistenz: .npz / JSON / GIF]
+        A1[Run once / epochs]
+        A2[Parameters: VQE, SubQG, LR, Hamiltonian JSON]
+        A3[Plots: VQE, PCA, Heatmaps, Metrics]
+        A4[Persistence: NPZ / JSON / GIF]
     end
 
-    subgraph Driver[CipherCore_OpenCl.dll]
-      D1[initialize_gpu / finish / shutdown]
-      D2[allocate / free / H2D / D2H]
-      D3[Proto: assignment / segsum / update]
-      D4[SubQG: init_batched / step_batched]
-      D5[VQE: execute_vqe_gpu, set_noise_level]
+    subgraph Core[CipherCore_OpenCl.dll Driver]
+        D1[initialize_gpu / finish / shutdown]
+        D2[allocate / free / H2D / D2H]
+        D3[Proto: assignment / segsum / update]
+        D4[SubQG: init_batched / step_batched]
+        D5[VQE: execute_vqe_gpu / set_noise_level]
     end
 
-    A1 -->|Parameter, Seeds| P[Tri-Core Pipeline (Epoche)]
-    P -->|ctypes Calls| Driver
-    Driver -->|Rohdaten (Indizes, Summen, Feld, E)| P
-    P -->|Metriken, Projektionen| A3
-    A2 -->|Hamiltonian JSON| P
-    A4 <-->|History & Epoche-Daten| P
+    %% safer node label (quotes)
+    P["Tri-Core Pipeline / Epoch"]
+
+    %% main flow (ASCII-only edge labels)
+    A1 -->|params and seeds| P
+    P  -->|ctypes calls| Core
+    Core -->|raw data: indices · sums · field · E| P
+    P  -->|metrics and projections| A3
+    A2 -->|hamiltonian json| P
+    A4 -->|history and epoch data| P
+    P  -->|history and epoch data| A4
+
+
 ```
 
 **Ablauf pro Epoche (vereinfacht):**
