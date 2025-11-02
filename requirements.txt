@@ -1,0 +1,6 @@
+streamlit>=1.36
+numpy>=2.0
+matplotlib>=3.9
+plotly>=5.22
+imageio>=2.34
+Pillow>=10.3
