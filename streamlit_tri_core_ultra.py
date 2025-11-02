@@ -612,25 +612,53 @@ def vqe_optimize(ctx: DriverCtx,
                  layers: int,
                  iters: int,
                  pauli_terms: list[tuple[int, float]],
+                 ansatz: str,
+                 gate_set: Sequence[str],
                  method: str,
                  seed: int,
                  shots: int,
                  gate_penalty: float,
                  use_analytic_grad: bool,
-                 progress_cb: Optional[callable] = None) -> tuple[list[float], np.ndarray, float]:
-    method = method.lower()
+                 progress_cb: Optional[callable] = None
+                 ) -> tuple[list[float], np.ndarray, float]:
+    """
+    Wählt den Optimierer (SPSA vs. analytisch/numerisch) und reicht
+    'ansatz' + 'gate_set' sauber an die jeweiligen Optimierer weiter.
+    """
+    method = str(method).lower()
+
     if method == "analytic":
+        # Gradient Descent – wahlweise mit Surrogat-Gradienten
         return vqe_gradient_descent(
-            ctx, qubits, layers, iters, pauli_terms,
-            ansatz, gate_set,
-            seed=seed, shots=shots, gate_penalty=gate_penalty,
-            use_analytic=use_analytic_grad, progress_cb=progress_cb,
+            ctx=ctx,
+            qubits=qubits,
+            layers=layers,
+            iters=iters,
+            pauli_terms=pauli_terms,
+            ansatz=ansatz,
+            gate_set=gate_set,
+            seed=seed,
+            shots=shots,
+            gate_penalty=gate_penalty,
+            use_analytic=use_analytic_grad,
+            progress_cb=progress_cb,
         )
+
+    # Default: SPSA
     return vqe_spsa(
-        ctx, qubits, layers, iters, pauli_terms,
-        ansatz, gate_set,
-        seed=seed, shots=shots, gate_penalty=gate_penalty, progress_cb=progress_cb,
+        ctx=ctx,
+        qubits=qubits,
+        layers=layers,
+        iters=iters,
+        pauli_terms=pauli_terms,
+        ansatz=ansatz,
+        gate_set=gate_set,
+        seed=seed,
+        shots=shots,
+        gate_penalty=gate_penalty,
+        progress_cb=progress_cb,
     )
+
 
 # =============================================================================
 # Pipeline: ein Durchlauf (liefert Mess-Struktur inkl. PCA & Feldkarte)
