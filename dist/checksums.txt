@@ -1,0 +1,5 @@
+CipherCore_OpenCl.dll:
+SHA256-Hash von G:\BICM-treiber-neu\driver_build\..\dist\CipherCore_OpenCl.dll:
+05fd54bd80a5219c26faf8bff0730639d85d7703be27f2e424bdb1205a0c8f42
+
+
