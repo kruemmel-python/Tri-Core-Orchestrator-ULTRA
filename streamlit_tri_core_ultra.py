@@ -24,9 +24,11 @@ import json
 import math
 import os
 import io
+import time
+import random
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Final, Optional
+from typing import Final, Optional, Sequence
 
 import numpy as np
 import streamlit as st
@@ -220,25 +222,175 @@ def square_reshape(vec: np.ndarray) -> np.ndarray:
 # LR-Kopplungen
 # =============================================================================
 
-def lr_modulated(base: float, score: float, mode: str, p1: float, p2: float) -> float:
-    """Moduliere base-LR anhand score mit gewähltem Modus + Parametern."""
+def _lr_component(base: float, score: float, mode: str, p1: float, p2: float) -> float:
+    """Interner Helfer: einzelne LR-Komponente."""
     x = max(0.0, float(score))
-    match mode:
-        case "exp":
-            s = 1.0 - math.exp(-p1 * x)         # p1: Steilheit
-            lr = base * (0.5 + p2 * s)          # p2: Gain
-        case "sigmoid":
-            s = 1.0 / (1.0 + math.exp(-p1 * (x - p2)))  # p1: Steilheit, p2: Center
-            lr = base * (0.5 + s)
-        case "tanh":
-            s = 0.5 * (1.0 + math.tanh(p1 * (x - p2)))  # p1: Steilheit, p2: Center
-            lr = base * (0.5 + s)
-        case "linear":
-            lr = base * (0.5 + p1 * x)          # p1: Steigung
-        case _:
-            s = 1.0 - math.exp(-x)
-            lr = base * (0.5 + s)
+    if mode == "exp":
+        s = 1.0 - math.exp(-p1 * x)
+        return base * (0.5 + p2 * s)
+    if mode == "sigmoid":
+        s = 1.0 / (1.0 + math.exp(-p1 * (x - p2)))
+        return base * (0.5 + s)
+    if mode == "tanh":
+        s = 0.5 * (1.0 + math.tanh(p1 * (x - p2)))
+        return base * (0.5 + s)
+    if mode == "linear":
+        return base * (0.5 + p1 * x)
+    # Fallback
+    s = 1.0 - math.exp(-x)
+    return base * (0.5 + s)
+
+
+def lr_modulated(base: float,
+                 score: float,
+                 mode: str,
+                 p1: float,
+                 p2: float,
+                 mix_weights: Optional[tuple[float, float]] = None) -> float:
+    """Moduliere base-LR anhand score mit gewähltem Modus + Parametern."""
+    if mode == "mix":
+        w_exp, w_sig = mix_weights or (0.5, 0.5)
+        total = w_exp + w_sig
+        if total <= 0:
+            w_exp = w_sig = 0.5
+            total = 1.0
+        w_exp /= total
+        w_sig /= total
+        lr_exp = _lr_component(base, score, "exp", p1, p2)
+        lr_sig = _lr_component(base, score, "sigmoid", p1, p2)
+        lr = w_exp * lr_exp + w_sig * lr_sig
+    else:
+        lr = _lr_component(base, score, mode, p1, p2)
     return max(LR_MIN, min(LR_MAX, lr))
+
+
+def proto_lr_mask_from_field(mean_map: np.ndarray,
+                             n_protos: int,
+                             strength: float) -> np.ndarray:
+    """Erzeuge LR-Maske pro Proto auf Basis lokaler Feldenergie."""
+    if n_protos <= 0:
+        return np.empty((0,), dtype=np.float32)
+    field = np.asarray(mean_map, dtype=np.float32)
+    if field.size == 0 or strength <= 0:
+        return np.ones((n_protos,), dtype=np.float32)
+    norm = field - field.min()
+    span = float(norm.max() if norm.size else 0.0)
+    if span > 0:
+        norm /= span
+    else:
+        norm.fill(0.5)
+    idx = np.linspace(0, norm.size - 1, n_protos)
+    samples = np.interp(idx, np.arange(norm.size), norm)
+    mask = 1.0 + strength * (samples - 0.5)
+    return np.clip(mask.astype(np.float32), 0.1, 2.5)
+
+
+def assignment_metrics(idx_flat: np.ndarray, n_protos: int) -> tuple[float, float]:
+    """Berechne Entropie & Coverage der Proto-Zuweisung."""
+    if idx_flat.size == 0 or n_protos <= 0:
+        return 0.0, 0.0
+    counts = np.bincount(idx_flat.clip(0, n_protos - 1), minlength=n_protos).astype(np.float64)
+    total = counts.sum()
+    if total <= 0:
+        return 0.0, 0.0
+    probs = counts / total
+    entropy = -float(np.sum(np.where(probs > 0, probs * np.log2(probs), 0.0)))
+    coverage = float(np.count_nonzero(counts)) / float(n_protos)
+    return entropy, coverage
+
+
+def stability_index(energies: Sequence[float]) -> float:
+    if not energies:
+        return 0.0
+    arr = np.asarray(energies, dtype=np.float64)
+    if arr.size <= 1:
+        return 0.0
+    diffs = np.abs(np.diff(arr))
+    return float(diffs.mean())
+
+
+def energy_delta_per_second(energies: Sequence[float], duration_ms: float) -> float:
+    if not energies or duration_ms <= 0:
+        return 0.0
+    delta = float(energies[0] - energies[-1])
+    return delta / (duration_ms / 1000.0)
+
+
+def gate_penalty_from_selection(gate_set: Sequence[str]) -> float:
+    if not gate_set:
+        return 0.0
+    unique = len(set(gate_set))
+    return 0.0025 * unique
+
+
+def num_params_for_ansatz(ansatz: str, qubits: int, layers: int, gate_set: Sequence[str]) -> int:
+    ansatz = ansatz.lower()
+    base = qubits * 2 * layers
+    gate_factor = max(1, len(gate_set))
+    if ansatz == "hardware-efficient":
+        base = qubits * layers * gate_factor
+    elif ansatz == "uccsd":
+        base = max(1, qubits * max(0, qubits - 1) // 2) * layers
+    elif ansatz == "custom-cr":
+        base = qubits * layers * (gate_factor + 1)
+    return max(1, int(base))
+
+
+def build_export_payload(history: dict, params: dict) -> dict:
+    payload = {
+        "epoch": list(history.get("epoch", [])),
+        "field_score_mean": list(history.get("field_score", [])),
+        "vqe_best_E": list(history.get("vqe_best_E", [])),
+        "delta_proto_l2_total": list(history.get("delta_proto_l2_total", [])),
+        "noise_set": list(history.get("noise_set", [])),
+        "stability_index": list(history.get("stability_index", [])),
+        "assignment_entropy": list(history.get("assignment_entropy", [])),
+        "proto_coverage": list(history.get("proto_coverage", [])),
+        "epoch_ms": list(history.get("epoch_ms", [])),
+        "energy_delta_per_sec": list(history.get("energy_delta_per_sec", [])),
+        "params": params,
+    }
+    return payload
+
+
+def golden_run_snapshot(seed: int = 2024) -> dict:
+    rng = random.Random(seed)
+    hist = {
+        "epoch": list(range(1, 4)),
+        "field_score": [rng.random() for _ in range(3)],
+        "vqe_best_E": [rng.uniform(-0.2, 0.2) for _ in range(3)],
+        "delta_proto_l2_total": [rng.random() for _ in range(3)],
+        "noise_set": [rng.random() for _ in range(3)],
+        "stability_index": [rng.random() for _ in range(3)],
+        "assignment_entropy": [rng.random() for _ in range(3)],
+        "proto_coverage": [rng.random() for _ in range(3)],
+        "epoch_ms": [rng.random() * 100 for _ in range(3)],
+        "energy_delta_per_sec": [rng.uniform(-1.0, 1.0) for _ in range(3)],
+    }
+    params = {
+        "qubits": 6,
+        "layers": 2,
+        "spsa_iters": 25,
+        "B": B,
+        "S": S,
+        "E": E,
+        "T": T,
+        "SUBQG_BATCH_CELLS": SUBQG_BATCH_CELLS,
+        "subqg_samples": 5,
+        "lr_mode": "mix",
+        "lr_p1": 2.5,
+        "lr_p2": 0.3,
+        "lr_mix_w_exp": 0.6,
+        "lr_mix_w_sig": 0.4,
+        "proto_mask_strength": 0.8,
+        "vqe_shots": 1024,
+        "ansatz": "Hardware-Efficient",
+        "gate_set": ["RX", "RY", "CRX"],
+        "optim_method": "spsa",
+        "use_analytic_grad": False,
+        "pauli_terms": json.dumps([{ "z_mask": 1, "c": 1.0 }]),
+    }
+    return build_export_payload(hist, params)
 
 # =============================================================================
 # SubQG & VQE (mit flexiblem Hamiltonian)
@@ -326,7 +478,10 @@ def parse_pauli_z_terms(json_text: str) -> list[tuple[int, float]]:
 
 def vqe_energy(ctx: DriverCtx, params: np.ndarray,
                qubits: int, layers: int,
-               pauli_terms: list[tuple[int, float]]) -> float:
+               pauli_terms: list[tuple[int, float]],
+               shots: int = 0,
+               gate_penalty: float = 0.0,
+               rng: Optional[np.random.Generator] = None) -> float:
     c_terms = (PauliZTerm * len(pauli_terms))(
         *[PauliZTerm(int(z), float(c)) for (z, c) in pauli_terms]
     )
@@ -337,17 +492,27 @@ def vqe_energy(ctx: DriverCtx, params: np.ndarray,
         c_terms, len(pauli_terms),
         ct.byref(out_E), ct.POINTER(ct.c_float)()
     ), "execute_vqe_gpu")
-    return float(out_E.value)
+    energy = float(out_E.value) + float(gate_penalty)
+    if shots and shots > 0:
+        if rng is None:
+            rng = np.random.default_rng()
+        noise = rng.normal(loc=0.0, scale=1.0 / math.sqrt(shots))
+        energy += float(noise)
+    return energy
 
 
 def vqe_spsa(ctx: DriverCtx,
              qubits: int, layers: int,
              iters: int,
              pauli_terms: list[tuple[int, float]],
+             ansatz: str,
+             gate_set: Sequence[str],
              seed: int = 1234,
+             shots: int = 0,
+             gate_penalty: float = 0.0,
              progress_cb: Optional[callable] = None) -> tuple[list[float], np.ndarray, float]:
     rng = np.random.default_rng(seed)
-    num_params = qubits * 2 * layers
+    num_params = num_params_for_ansatz(ansatz, qubits, layers, gate_set)
     theta = rng.uniform(-math.pi, math.pi, size=(num_params,)).astype(np.float32)
 
     best_E = float("inf")
@@ -362,13 +527,13 @@ def vqe_spsa(ctx: DriverCtx,
         thetap = theta + c_k * delta
         thetam = theta - c_k * delta
 
-        Ep = vqe_energy(ctx, thetap, qubits, layers, pauli_terms)
-        Em = vqe_energy(ctx, thetam, qubits, layers, pauli_terms)
+        Ep = vqe_energy(ctx, thetap, qubits, layers, pauli_terms, shots=shots, gate_penalty=gate_penalty, rng=rng)
+        Em = vqe_energy(ctx, thetam, qubits, layers, pauli_terms, shots=shots, gate_penalty=gate_penalty, rng=rng)
 
         ghat = (Ep - Em) / (2.0 * c_k * delta)
         theta = theta - a_k * ghat.astype(np.float32)
 
-        E = vqe_energy(ctx, theta, qubits, layers, pauli_terms)
+        E = vqe_energy(ctx, theta, qubits, layers, pauli_terms, shots=shots, gate_penalty=gate_penalty, rng=rng)
         energies.append(E)
         if E < best_E:
             best_E = E
@@ -378,6 +543,94 @@ def vqe_spsa(ctx: DriverCtx,
             progress_cb(k, E, best_E)
 
     return energies, best_theta, best_E
+
+
+def _analytic_surrogate_gradient(theta: np.ndarray,
+                                 pauli_terms: Sequence[tuple[int, float]]) -> np.ndarray:
+    freq = np.array([max(1, int(bin(int(z)).count("1"))) for (z, _) in pauli_terms], dtype=np.float32)
+    coeff = np.array([float(c) for (_, c) in pauli_terms], dtype=np.float32)
+    if freq.size == 0:
+        freq = np.ones((1,), dtype=np.float32)
+        coeff = np.ones((1,), dtype=np.float32)
+    grad = np.zeros_like(theta, dtype=np.float32)
+    for i in range(theta.size):
+        grad[i] = np.sum(coeff * np.sin(theta[i] * freq)) / float(freq.size)
+    return grad
+
+
+def vqe_gradient_descent(ctx: DriverCtx,
+                         qubits: int, layers: int,
+                         iters: int,
+                         pauli_terms: list[tuple[int, float]],
+                         ansatz: str,
+                         gate_set: Sequence[str],
+                         seed: int = 2024,
+                         shots: int = 0,
+                         gate_penalty: float = 0.0,
+                         use_analytic: bool = False,
+                         progress_cb: Optional[callable] = None) -> tuple[list[float], np.ndarray, float]:
+    rng = np.random.default_rng(seed)
+    num_params = num_params_for_ansatz(ansatz, qubits, layers, gate_set)
+    theta = rng.uniform(-math.pi, math.pi, size=(num_params,)).astype(np.float32)
+    lr = 0.1
+    energies: list[float] = []
+    best_E = float("inf")
+    best_theta = theta.copy()
+    eps = 1e-3
+
+    for k in range(1, iters + 1):
+        if use_analytic:
+            grad = _analytic_surrogate_gradient(theta, pauli_terms)
+        else:
+            grad = np.zeros_like(theta, dtype=np.float32)
+            basis = np.zeros_like(theta, dtype=np.float32)
+            for i in range(theta.size):
+                basis.fill(0.0)
+                basis[i] = 1.0
+                e_plus = vqe_energy(ctx, theta + eps * basis,
+                                    qubits, layers, pauli_terms,
+                                    shots=shots, gate_penalty=gate_penalty, rng=rng)
+                e_minus = vqe_energy(ctx, theta - eps * basis,
+                                     qubits, layers, pauli_terms,
+                                     shots=shots, gate_penalty=gate_penalty, rng=rng)
+                grad[i] = (e_plus - e_minus) / (2 * eps)
+
+        theta = theta - lr * grad
+        energy = vqe_energy(ctx, theta, qubits, layers, pauli_terms, shots=shots, gate_penalty=gate_penalty, rng=rng)
+        energies.append(energy)
+        if energy < best_E:
+            best_E = energy
+            best_theta = theta.copy()
+        if progress_cb:
+            progress_cb(k, energy, best_E)
+
+    return energies, best_theta, best_E
+
+
+def vqe_optimize(ctx: DriverCtx,
+                 qubits: int,
+                 layers: int,
+                 iters: int,
+                 pauli_terms: list[tuple[int, float]],
+                 method: str,
+                 seed: int,
+                 shots: int,
+                 gate_penalty: float,
+                 use_analytic_grad: bool,
+                 progress_cb: Optional[callable] = None) -> tuple[list[float], np.ndarray, float]:
+    method = method.lower()
+    if method == "analytic":
+        return vqe_gradient_descent(
+            ctx, qubits, layers, iters, pauli_terms,
+            ansatz, gate_set,
+            seed=seed, shots=shots, gate_penalty=gate_penalty,
+            use_analytic=use_analytic_grad, progress_cb=progress_cb,
+        )
+    return vqe_spsa(
+        ctx, qubits, layers, iters, pauli_terms,
+        ansatz, gate_set,
+        seed=seed, shots=shots, gate_penalty=gate_penalty, progress_cb=progress_cb,
+    )
 
 # =============================================================================
 # Pipeline: ein Durchlauf (liefert Mess-Struktur inkl. PCA & Feldkarte)
@@ -391,7 +644,15 @@ def run_pipeline_once(ctx: DriverCtx,
                       lr_mode: str,
                       lr_p1: float,
                       lr_p2: float,
+                      lr_mix_w_exp: float,
+                      lr_mix_w_sig: float,
+                      proto_mask_strength: float,
                       subqg_samples: int,
+                      vqe_shots: int,
+                      ansatz: str,
+                      gate_set: Sequence[str],
+                      optim_method: str,
+                      use_analytic_grad: bool,
                       rng_seed: int = 42,
                       spsa_seed: int = 123) -> dict:
     rng = np.random.default_rng(rng_seed)
@@ -441,15 +702,29 @@ def run_pipeline_once(ctx: DriverCtx,
 
     # B) SubQG → Feld-Score/-Karte (Konfidenz über mehrere Samples)
     field_score, mean_map, std_map = run_subqg_with_confidence(ctx, rng, n_samples=subqg_samples)
-    lr_mod = lr_modulated(BASE_LR, field_score, lr_mode, lr_p1, lr_p2)
+    mix_weights = (lr_mix_w_exp, lr_mix_w_sig) if lr_mode == "mix" else None
+    lr_mod = lr_modulated(BASE_LR, field_score, lr_mode, lr_p1, lr_p2, mix_weights=mix_weights)
+    proto_mask = proto_lr_mask_from_field(mean_map, T, proto_mask_strength)
 
     # C) VQE (SPSA) → best_E → set_noise_level
     def _progress(k, E, bestE):
         st.write(f"[VQE] iter={k:03d} E={E:.6f} best={bestE:.6f}")
 
-    energies, best_theta, best_E = vqe_spsa(
-        ctx, qubits=qubits, layers=layers, iters=vqe_iters,
-        pauli_terms=pauli_terms, seed=spsa_seed, progress_cb=_progress
+    gate_penalty = gate_penalty_from_selection(gate_set)
+    energies, best_theta, best_E = vqe_optimize(
+        ctx,
+        qubits=qubits,
+        layers=layers,
+        iters=vqe_iters,
+        pauli_terms=pauli_terms,
+        method=optim_method,
+        seed=spsa_seed,
+        shots=vqe_shots,
+        gate_penalty=gate_penalty,
+        use_analytic_grad=use_analytic_grad,
+        progress_cb=_progress,
+        ansatz=ansatz,
+        gate_set=gate_set,
     )
     new_noise = float(np.clip(SUBQG_NOISE * (1.0 + 0.25 * best_E), 0.0, 1.0))
     ctx.dll.set_noise_level(ctx.gpu, new_noise)
@@ -459,7 +734,17 @@ def run_pipeline_once(ctx: DriverCtx,
         ctx.gpu, buf_Te, buf_ps, buf_pc, ct.c_float(lr_mod), E, T
     ), "execute_proto_update_step_gpu [2]")
 
-    prototypes_updated = gpu_download(ctx, buf_Te, (T, E), np.float32)
+    prototypes_stage2 = gpu_download(ctx, buf_Te, (T, E), np.float32)
+    stage1_delta = prototypes_stage2 - proto_before
+    masked_delta = proto_mask[:, None] * stage1_delta
+    prototypes_updated = proto_before + masked_delta
+    _chk(ctx.dll.write_host_to_gpu_blocking(
+        ctx.gpu,
+        buf_Te,
+        0,
+        prototypes_updated.nbytes,
+        prototypes_updated.ctypes.data_as(ct.c_void_p),
+    ), "apply_proto_mask")
     delta = float(np.linalg.norm(prototypes_updated - proto_before))
 
     # PCA fit auf concat -> stabile Achsen
@@ -471,6 +756,10 @@ def run_pipeline_once(ctx: DriverCtx,
     # Per-Proto-Metriken
     d_emb = np.linalg.norm(prototypes_updated - proto_before, axis=1)   # im Embedding
     d_pca = np.linalg.norm(proj_after - proj_before, axis=1)            # in PCA
+
+    entropy, coverage = assignment_metrics(idx_flat, T)
+
+    stability = stability_index(energies)
 
     for buf in (buf_A, buf_Te, buf_idx, buf_Aflat, buf_idxflat, buf_ps, buf_pc):
         ctx.dll.free_gpu_memory(ctx.gpu, buf)
@@ -494,6 +783,17 @@ def run_pipeline_once(ctx: DriverCtx,
         "lr_mode": lr_mode,
         "lr_p1": lr_p1,
         "lr_p2": lr_p2,
+        "lr_mix": (lr_mix_w_exp, lr_mix_w_sig),
+        "proto_mask": proto_mask,
+        "assignment_entropy": entropy,
+        "proto_coverage": coverage,
+        "stability_index": stability,
+        "gate_penalty": gate_penalty,
+        "ansatz": ansatz,
+        "gate_set": list(gate_set),
+        "shots": vqe_shots,
+        "optim_method": optim_method,
+        "use_analytic_grad": use_analytic_grad,
     }
 
 # =============================================================================
@@ -543,28 +843,100 @@ with st.sidebar:
     st.query_params["gpu"] = str(st.session_state["gpu_index"])  # Nur GPU in URL, nicht DLL!
 
     st.divider()
-    st.subheader("VQE / SPSA")
+    if "ansatz" not in st.session_state:
+        st.session_state["ansatz"] = "Hardware-Efficient"
+    if "gate_set" not in st.session_state:
+        st.session_state["gate_set"] = ["RX", "RY", "RZ", "CRX"]
+    if "vqe_shots" not in st.session_state:
+        st.session_state["vqe_shots"] = 1024
+    if "optim_method" not in st.session_state:
+        st.session_state["optim_method"] = "SPSA"
+    if "use_analytic_grad" not in st.session_state:
+        st.session_state["use_analytic_grad"] = False
+    if "proto_mask_strength" not in st.session_state:
+        st.session_state["proto_mask_strength"] = 0.5
+    if "lr_mode" not in st.session_state:
+        st.session_state["lr_mode"] = "exp"
+    if "lr_mix_w_exp" not in st.session_state:
+        st.session_state["lr_mix_w_exp"] = 0.6
+    if "lr_mix_w_sig" not in st.session_state:
+        st.session_state["lr_mix_w_sig"] = 0.4
+
+    st.subheader("VQE / Optimizer")
     vqe_qubits = st.number_input("Qubits", min_value=2, max_value=64, value=VQE_QUBITS_DEFAULT, step=1)
     vqe_layers = st.number_input("Layers", min_value=1, max_value=16, value=VQE_LAYERS_DEFAULT, step=1)
     vqe_iters  = st.number_input("SPSA-Iterationen", min_value=1, max_value=500, value=SPSA_ITERS_DEFAULT, step=1)
+    ansatz = st.selectbox("Ansatz", ["Hardware-Efficient", "UCCSD", "Custom-CR"], key="ansatz")
+    gate_choices = ["RX", "RY", "RZ", "CRX", "CRY", "CRZ"]
+    gate_set = st.multiselect(
+        "Gate-Familien",
+        gate_choices,
+        default=st.session_state.get("gate_set", ["RX", "RY", "RZ", "CRX"]),
+        key="gate_set",
+    )
+    vqe_shots = st.number_input(
+        "Mess-Shots",
+        min_value=0,
+        max_value=100000,
+        value=st.session_state.get("vqe_shots", 1024),
+        step=128,
+        key="vqe_shots",
+    )
+    optim_method = st.selectbox("Optimierer", ["SPSA", "Analytic"], key="optim_method")
+    use_analytic_grad = st.checkbox(
+        "Analytischer Gradientenpfad",
+        value=st.session_state.get("use_analytic_grad", False),
+        help="Verwendet Surrogat-Gradienten; fällt auf numerische Ableitung zurück, wenn der Treiber keinen analytischen Pfad bietet.",
+        key="use_analytic_grad",
+    )
 
     st.subheader("SubQG Konfidenz")
     subqg_samples = st.number_input("Samples pro Epoche (Konfidenz)", min_value=1, max_value=64, value=5, step=1)
+    proto_mask_strength = st.slider(
+        "Proto-LR-Maskenstärke",
+        min_value=0.0,
+        max_value=2.0,
+        value=st.session_state.get("proto_mask_strength", 0.5),
+        step=0.05,
+        key="proto_mask_strength",
+    )
 
     st.subheader("LR-Kopplung")
-    lr_mode = st.selectbox("Modus", ["exp", "sigmoid", "tanh", "linear"], index=0)
+    lr_mode = st.selectbox("Modus", ["exp", "sigmoid", "tanh", "linear", "mix"], key="lr_mode")
     if lr_mode == "exp":
-        lr_p1 = st.number_input("p1 (Steilheit)", value=1.0, step=0.1)
-        lr_p2 = st.number_input("p2 (Gain)", value=1.0, step=0.1)
+        lr_p1 = st.number_input("p1 (Steilheit)", value=1.0, step=0.1, key="lr_p1_exp")
+        lr_p2 = st.number_input("p2 (Gain)", value=1.0, step=0.1, key="lr_p2_exp")
     elif lr_mode == "sigmoid":
-        lr_p1 = st.number_input("p1 (Steilheit)", value=10.0, step=0.5)
-        lr_p2 = st.number_input("p2 (Center)", value=0.1, step=0.05)
+        lr_p1 = st.number_input("p1 (Steilheit)", value=10.0, step=0.5, key="lr_p1_sig")
+        lr_p2 = st.number_input("p2 (Center)", value=0.1, step=0.05, key="lr_p2_sig")
     elif lr_mode == "tanh":
-        lr_p1 = st.number_input("p1 (Steilheit)", value=5.0, step=0.5)
-        lr_p2 = st.number_input("p2 (Center)", value=0.1, step=0.05)
+        lr_p1 = st.number_input("p1 (Steilheit)", value=5.0, step=0.5, key="lr_p1_tanh")
+        lr_p2 = st.number_input("p2 (Center)", value=0.1, step=0.05, key="lr_p2_tanh")
+    elif lr_mode == "mix":
+        lr_p1 = st.number_input("p1 (Steilheit)", value=3.0, step=0.2, key="lr_p1_mix")
+        lr_p2 = st.number_input("p2 (Center)", value=0.2, step=0.05, key="lr_p2_mix")
+        lr_mix_w_exp = st.slider(
+            "Gewicht exp",
+            min_value=0.0,
+            max_value=1.0,
+            value=st.session_state.get("lr_mix_w_exp", 0.6),
+            step=0.05,
+            key="lr_mix_w_exp",
+        )
+        lr_mix_w_sig = st.slider(
+            "Gewicht sigmoid",
+            min_value=0.0,
+            max_value=1.0,
+            value=st.session_state.get("lr_mix_w_sig", 0.4),
+            step=0.05,
+            key="lr_mix_w_sig",
+        )
     else:  # linear
-        lr_p1 = st.number_input("p1 (Steigung)", value=1.0, step=0.1)
-        lr_p2 = st.number_input("p2 (reserviert)", value=0.0, step=0.1)
+        lr_p1 = st.number_input("p1 (Steigung)", value=1.0, step=0.1, key="lr_p1_lin")
+        lr_p2 = st.number_input("p2 (reserviert)", value=0.0, step=0.1, key="lr_p2_lin")
+    if lr_mode != "mix":
+        lr_mix_w_exp = 0.5
+        lr_mix_w_sig = 0.5
 
     st.divider()
     st.subheader("Pauli-Z Hamiltonian (JSON)")
@@ -595,6 +967,11 @@ if "history" not in st.session_state:
         "vqe_best_E": [],
         "delta_proto_l2_total": [],
         "noise_set": [],
+        "stability_index": [],
+        "assignment_entropy": [],
+        "proto_coverage": [],
+        "epoch_ms": [],
+        "energy_delta_per_sec": [],
     }
 
 if "bench" not in st.session_state:
@@ -795,9 +1172,15 @@ with st.expander("💾 Persistenz – Läufe speichern & laden", expanded=False)
                 "history_vqe_best_E": np.array(h["vqe_best_E"], dtype=np.float32),
                 "history_delta_proto": np.array(h["delta_proto_l2_total"], dtype=np.float32),
                 "history_noise_set": np.array(h["noise_set"], dtype=np.float32),
+                "history_stability": np.array(h["stability_index"], dtype=np.float32),
+                "history_entropy": np.array(h["assignment_entropy"], dtype=np.float32),
+                "history_coverage": np.array(h["proto_coverage"], dtype=np.float32),
+                "history_epoch_ms": np.array(h["epoch_ms"], dtype=np.float32),
+                "history_energy_speed": np.array(h["energy_delta_per_sec"], dtype=np.float32),
             }
             ed_json = []
             for item in ed:
+                mask = np.asarray(item.get("proto_mask", np.ones((T,), dtype=np.float32)), dtype=float)
                 ed_json.append({
                     "pca_before": item["pca_before"].tolist(),
                     "pca_after": item["pca_after"].tolist(),
@@ -805,6 +1188,9 @@ with st.expander("💾 Persistenz – Läufe speichern & laden", expanded=False)
                     "field_map_std": item["field_map_std"].tolist(),
                     "delta_per_proto_emb": item["delta_per_proto_emb"].tolist(),
                     "delta_per_proto_pca": item["delta_per_proto_pca"].tolist(),
+                    "proto_mask": mask.tolist(),
+                    "assignment_entropy": float(item.get("assignment_entropy", 0.0)),
+                    "proto_coverage": float(item.get("proto_coverage", 0.0)),
                 })
             pack_bytes = json.dumps(ed_json).encode("utf-8")
 
@@ -815,7 +1201,15 @@ with st.expander("💾 Persistenz – Läufe speichern & laden", expanded=False)
                 "lr_mode": lr_mode,
                 "lr_p1": float(lr_p1),
                 "lr_p2": float(lr_p2),
+                "lr_mix_w_exp": float(lr_mix_w_exp),
+                "lr_mix_w_sig": float(lr_mix_w_sig),
+                "proto_mask_strength": float(proto_mask_strength),
                 "subqg_samples": int(subqg_samples),
+                "vqe_shots": int(vqe_shots),
+                "ansatz": ansatz,
+                "gate_set": gate_set,
+                "optim_method": optim_method,
+                "use_analytic_grad": bool(use_analytic_grad),
                 "dll": str(st.session_state["dll_path"]),
                 "gpu": int(st.session_state["gpu_index"]),
                 "pauli_terms": st.session_state["hamilton_json"],
@@ -849,6 +1243,19 @@ with st.expander("💾 Persistenz – Läufe speichern & laden", expanded=False)
                     "delta_proto_l2_total": data["history_delta_proto"].astype(float).tolist(),
                     "noise_set": data["history_noise_set"].astype(float).tolist(),
                 }
+                files = set(data.files)
+                n_hist = len(st.session_state["history"]["epoch"])
+                def _load_hist(name: str) -> list[float]:
+                    if name in files:
+                        return data[name].astype(float).tolist()
+                    return [0.0] * n_hist
+
+                st.session_state["history"]["stability_index"] = _load_hist("history_stability")
+                st.session_state["history"]["assignment_entropy"] = _load_hist("history_entropy")
+                st.session_state["history"]["proto_coverage"] = _load_hist("history_coverage")
+                st.session_state["history"]["epoch_ms"] = _load_hist("history_epoch_ms")
+                st.session_state["history"]["energy_delta_per_sec"] = _load_hist("history_energy_speed")
+
                 ed_json = json.loads(bytes(data["epoch_data_json"]).decode("utf-8"))
                 st.session_state["epoch_data"] = []
                 for item in ed_json:
@@ -859,12 +1266,33 @@ with st.expander("💾 Persistenz – Läufe speichern & laden", expanded=False)
                         "field_map_std": np.array(item["field_map_std"], dtype=np.float32),
                         "delta_per_proto_emb": np.array(item["delta_per_proto_emb"], dtype=np.float32),
                         "delta_per_proto_pca": np.array(item["delta_per_proto_pca"], dtype=np.float32),
+                        "proto_mask": np.array(item.get("proto_mask", [1.0] * T), dtype=np.float32),
+                        "assignment_entropy": float(item.get("assignment_entropy", 0.0)),
+                        "proto_coverage": float(item.get("proto_coverage", 0.0)),
                     })
                 params = json.loads(bytes(data["params_json"]).decode("utf-8"))
                 st.session_state["gpu_index"] = int(params.get("gpu", st.session_state["gpu_index"]))
                 st.query_params["gpu"] = str(st.session_state["gpu_index"])
                 st.session_state["dll_path"] = params.get("dll", st.session_state["dll_path"])
                 st.session_state["hamilton_json"] = params.get("pauli_terms", st.session_state["hamilton_json"])
+                st.session_state["lr_mode"] = params.get("lr_mode", st.session_state.get("lr_mode", "exp"))
+                lr_mix_params = params.get("lr_mix_w_exp"), params.get("lr_mix_w_sig")
+                if all(v is not None for v in lr_mix_params):
+                    lr_mix_w_exp, lr_mix_w_sig = map(float, lr_mix_params)
+                    st.session_state["lr_mix_w_exp"] = lr_mix_w_exp
+                    st.session_state["lr_mix_w_sig"] = lr_mix_w_sig
+                proto_mask_strength = float(params.get("proto_mask_strength", proto_mask_strength))
+                st.session_state["proto_mask_strength"] = proto_mask_strength
+                vqe_shots = int(params.get("vqe_shots", vqe_shots))
+                st.session_state["vqe_shots"] = vqe_shots
+                ansatz = params.get("ansatz", ansatz)
+                st.session_state["ansatz"] = ansatz
+                gate_set = params.get("gate_set", gate_set)
+                st.session_state["gate_set"] = gate_set
+                optim_method = params.get("optim_method", optim_method)
+                st.session_state["optim_method"] = optim_method
+                use_analytic_grad = params.get("use_analytic_grad", use_analytic_grad)
+                st.session_state["use_analytic_grad"] = use_analytic_grad
                 st.success("Sitzung geladen.")
                 st.info(f"Geladene Parameter: {params}")
             except Exception as e:
@@ -886,6 +1314,7 @@ def run_and_store(n_epochs: int) -> None:
         for _ in range(n_epochs):
             ep_no = len(st.session_state["history"]["epoch"]) + 1
             st.write(f"### 🧪 Epoche {ep_no}")
+            t0 = time.perf_counter()
             res = run_pipeline_once(
                 ctx,
                 qubits=int(vqe_qubits),
@@ -893,9 +1322,18 @@ def run_and_store(n_epochs: int) -> None:
                 vqe_iters=int(vqe_iters),
                 pauli_terms=terms,
                 lr_mode=lr_mode, lr_p1=float(lr_p1), lr_p2=float(lr_p2),
+                lr_mix_w_exp=float(lr_mix_w_exp), lr_mix_w_sig=float(lr_mix_w_sig),
+                proto_mask_strength=float(proto_mask_strength),
                 subqg_samples=int(subqg_samples),
+                vqe_shots=int(vqe_shots),
+                ansatz=ansatz,
+                gate_set=gate_set,
+                optim_method=str(optim_method).lower(),
+                use_analytic_grad=bool(use_analytic_grad),
                 rng_seed=42 + ep_no, spsa_seed=123 + ep_no,
             )
+            duration_ms = (time.perf_counter() - t0) * 1000.0
+            energy_speed = energy_delta_per_second(res["vqe_energies"], duration_ms)
 
             # History
             h = st.session_state["history"]
@@ -904,6 +1342,11 @@ def run_and_store(n_epochs: int) -> None:
             h["vqe_best_E"].append(res["vqe_best_E"])
             h["delta_proto_l2_total"].append(res["delta_proto_l2_total"])
             h["noise_set"].append(res["noise_set"])
+            h["stability_index"].append(res["stability_index"])
+            h["assignment_entropy"].append(res["assignment_entropy"])
+            h["proto_coverage"].append(res["proto_coverage"])
+            h["epoch_ms"].append(duration_ms)
+            h["energy_delta_per_sec"].append(energy_speed)
 
             # Epoche-Daten
             st.session_state["epoch_data"].append({
@@ -913,6 +1356,9 @@ def run_and_store(n_epochs: int) -> None:
                 "field_map_std":  res["field_map_std"],
                 "delta_per_proto_emb": res["delta_per_proto_emb"],
                 "delta_per_proto_pca": res["delta_per_proto_pca"],
+                "proto_mask": res["proto_mask"],
+                "assignment_entropy": res["assignment_entropy"],
+                "proto_coverage": res["proto_coverage"],
             })
 
             # Live-Plots
@@ -930,6 +1376,11 @@ def run_and_store(n_epochs: int) -> None:
                 st.metric("LR (moduliert)", f"{res['lr_mod']:.4f}")
                 st.metric("Noise gesetzt", f"{res['noise_set']:.4f}")
                 st.metric("ΔProto L2 (gesamt)", f"{res['delta_proto_l2_total']:.6f}")
+                st.metric("Stabilitätsindex", f"{res['stability_index']:.6f}")
+                st.metric("Assignment-Entropy", f"{res['assignment_entropy']:.4f}")
+                st.metric("Proto-Coverage", f"{res['proto_coverage']*100:.1f}%")
+                st.metric("ms pro Epoche", f"{duration_ms:.2f}")
+                st.metric("Energie-Δ / s", f"{energy_speed:.6f}")
 
         st.success("✅ Läufe abgeschlossen.")
     finally:
@@ -992,6 +1443,41 @@ with left:
             ax_dp.set_xlabel("Epoche"); ax_dp.set_ylabel("||Δ||₂")
             ax_dp.grid(True, alpha=0.3)
         st.pyplot(fig_dp, clear_figure=True)
+
+        # Stabilität & Entropy
+        stab = np.asarray(h["stability_index"], dtype=float)
+        ent = np.asarray(h["assignment_entropy"], dtype=float)
+        cov = np.asarray(h["proto_coverage"], dtype=float)
+        fig_stab, ax_stab = plt.subplots()
+        if epochs_arr.size == 1:
+            _plot_singleton(ax_stab, epochs_arr[0], stab[0],
+                            "Stabilitätsindex über Epochen", "Epoche", "Δ/Iter")
+        else:
+            ax_stab.plot(epochs_arr, stab, marker="o", label="Stabilitätsindex")
+            ax_stab.plot(epochs_arr, ent, marker="s", label="Entropy")
+            ax_stab.plot(epochs_arr, cov, marker="^", label="Coverage")
+            ax_stab.set_xlabel("Epoche")
+            ax_stab.set_ylabel("Wert")
+            ax_stab.set_title("Stabilität, Entropy & Coverage")
+            ax_stab.grid(True, alpha=0.3)
+            ax_stab.legend()
+        st.pyplot(fig_stab, clear_figure=True)
+
+        # KPI: ms pro Epoche & Energie-Delta/s
+        fig_kpi, ax_kpi = plt.subplots()
+        ms = np.asarray(h["epoch_ms"], dtype=float)
+        delta_speed = np.asarray(h["energy_delta_per_sec"], dtype=float)
+        ax_kpi.plot(epochs_arr, ms, marker="o", label="ms pro Epoche")
+        ax_kpi.set_xlabel("Epoche")
+        ax_kpi.set_ylabel("ms", color="tab:blue")
+        ax_kpi2 = ax_kpi.twinx()
+        ax_kpi2.plot(epochs_arr, delta_speed, marker="s", color="tab:red", label="EΔ/s")
+        ax_kpi2.set_ylabel("EΔ/s", color="tab:red")
+        ax_kpi.set_title("End-to-End KPIs")
+        lines, labels = ax_kpi.get_legend_handles_labels()
+        lines2, labels2 = ax_kpi2.get_legend_handles_labels()
+        ax_kpi.legend(lines + lines2, labels + labels2, loc="best")
+        st.pyplot(fig_kpi, clear_figure=True)
 
 # -----------------------------------------------------------------------------
 # PCA: Interaktiv + Zeitverlauf + GIF-Export (Slider-Fallback bei 1 Epoche)
@@ -1194,10 +1680,16 @@ else:
     mi = sel_ep_metrics - 1
     dm_emb = ed[mi]["delta_per_proto_emb"]
     dm_pca = ed[mi]["delta_per_proto_pca"]
+    proto_mask = ed[mi].get("proto_mask", np.ones((T,), dtype=np.float32))
 
-    table = np.stack([np.arange(T), dm_emb, dm_pca], axis=1)
-    sort_by = st.selectbox("Sortieren nach", ["Δ Embedding", "Δ PCA"])
-    order = np.argsort(-dm_emb) if sort_by == "Δ Embedding" else np.argsort(-dm_pca)
+    table = np.stack([np.arange(T), dm_emb, dm_pca, proto_mask], axis=1)
+    sort_by = st.selectbox("Sortieren nach", ["Δ Embedding", "Δ PCA", "LR-Maske"])
+    if sort_by == "Δ Embedding":
+        order = np.argsort(-dm_emb)
+    elif sort_by == "Δ PCA":
+        order = np.argsort(-dm_pca)
+    else:
+        order = np.argsort(-proto_mask)
     table_sorted = table[order]
     st.write("Top-Prototypen (absteigend):")
     st.dataframe(
@@ -1205,6 +1697,7 @@ else:
             "Proto": table_sorted[:, 0].astype(int),
             "Δ Embedding": np.round(table_sorted[:, 1].astype(float), 6),
             "Δ PCA": np.round(table_sorted[:, 2].astype(float), 6),
+            "LR-Maske": np.round(table_sorted[:, 3].astype(float), 4),
         },
         use_container_width=True,
     )
@@ -1221,27 +1714,35 @@ else:
     ax_bp.set_xlabel("Proto-ID"); ax_bp.set_ylabel("||Δ||₂ (PCA)")
     st.pyplot(fig_bp, clear_figure=True)
 
+    fig_mask, ax_mask = plt.subplots()
+    ax_mask.bar(np.arange(T), proto_mask)
+    ax_mask.set_title(f"LR-Maske pro Proto – Epoche {sel_ep_metrics}")
+    ax_mask.set_xlabel("Proto-ID"); ax_mask.set_ylabel("Skalierung")
+    st.pyplot(fig_mask, clear_figure=True)
+
 
 # -----------------------------------------------------------------------------
 # Export JSON (kompakte Zusammenfassung)
 # -----------------------------------------------------------------------------
-export = {
-    "epoch": h["epoch"],
-    "field_score_mean": h["field_score"],
-    "vqe_best_E": h["vqe_best_E"],
-    "delta_proto_l2_total": h["delta_proto_l2_total"],
-    "noise_set": h["noise_set"],
-    "params": {
-        "qubits": int(vqe_qubits),
-        "layers": int(vqe_layers),
-        "spsa_iters": int(vqe_iters),
-        "B": B, "S": S, "E": E, "T": T,
-        "SUBQG_BATCH_CELLS": SUBQG_BATCH_CELLS,
-        "subqg_samples": int(subqg_samples),
-        "lr_mode": lr_mode, "lr_p1": float(lr_p1), "lr_p2": float(lr_p2),
-        "pauli_terms": st.session_state["hamilton_json"],
-    }
+params_export = {
+    "qubits": int(vqe_qubits),
+    "layers": int(vqe_layers),
+    "spsa_iters": int(vqe_iters),
+    "B": B, "S": S, "E": E, "T": T,
+    "SUBQG_BATCH_CELLS": SUBQG_BATCH_CELLS,
+    "subqg_samples": int(subqg_samples),
+    "lr_mode": lr_mode, "lr_p1": float(lr_p1), "lr_p2": float(lr_p2),
+    "lr_mix_w_exp": float(lr_mix_w_exp),
+    "lr_mix_w_sig": float(lr_mix_w_sig),
+    "proto_mask_strength": float(proto_mask_strength),
+    "vqe_shots": int(vqe_shots),
+    "ansatz": ansatz,
+    "gate_set": gate_set,
+    "optim_method": optim_method,
+    "use_analytic_grad": bool(use_analytic_grad),
+    "pauli_terms": st.session_state["hamilton_json"],
 }
+export = build_export_payload(h, params_export)
 st.download_button(
     "📥 Ergebnisse als JSON herunterladen",
     data=json.dumps(export, ensure_ascii=False, indent=2).encode("utf-8"),
