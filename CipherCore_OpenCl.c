@@ -321,6 +321,8 @@ cl_program subqg_simulation_program = NULL;       cl_kernel subqg_simulation_ker
 cl_program subqg_simulation_program_fast = NULL;
 cl_kernel subqg_simulation_kernel_fast = NULL;
 cl_program subqg_agent_program = NULL;            cl_kernel subqg_agent_kernel = NULL;
+cl_program sqse_program = NULL;                   cl_kernel sqse_encrypt_kernel = NULL;
+cl_kernel sqse_decrypt_kernel = NULL;
 
 // Quantum Algorithm Kernels
 cl_program quantum_program = NULL;
@@ -738,6 +740,21 @@ DLLEXPORT int execute_proto_update_step_gpu(int gpu_index, void* prototypes, voi
 // Loss Shaping Exports
 DLLEXPORT int execute_shape_loss_with_reward_penalty_gpu(int gpu_index, void* loss_per_sample_in, void* predictions, void* targets, void* loss_per_sample_out, int num_samples, int num_classes, float penalty_weight, float reward_weight, float high_confidence_threshold, int critical_target_class, int critical_predicted_class);
 DLLEXPORT int execute_shape_loss_with_reward_penalty_list_gpu(int gpu_index, void* loss_per_sample_in, void* predictions, void* targets, void* loss_per_sample_out, void* critical_pairs, int num_samples, int num_classes, int num_critical_pairs, float penalty_weight, float reward_weight, float high_confidence_threshold); // NEU
+DLLEXPORT int sqse_load_kernels(const char* kernel_path);
+DLLEXPORT int execute_sqse_encrypt_float(const float* data_in,
+                                         const float* key,
+                                         int n,
+                                         float lambda_field,
+                                         int steps,
+                                         float* out_theta,
+                                         float* out_p_masked);
+DLLEXPORT int execute_sqse_decrypt_float(const float* in_theta,
+                                         const float* in_p_masked,
+                                         const float* key,
+                                         int n,
+                                         float lambda_field,
+                                         int steps,
+                                         float* data_out);
 DLLEXPORT void set_noise_level(int gpu_index, float value);
 DLLEXPORT float get_noise_level(int gpu_index);
 DLLEXPORT void register_kernel_measurement_buffers(float* error_ptr, float* variance_ptr);
@@ -911,6 +928,7 @@ static QuantumEchoProfile* g_active_quantum_profile = NULL;
 
 DLLEXPORT int get_last_quantum_echo_profile(QuantumEchoProfile* out_profile);
 
+static int ensure_sqse_kernels_ready(void);
 static cl_float2 make_complex(float real, float imag);
 static int ensure_quantum_kernels_ready(void);
 static int quantum_allocate_state(int num_qubits, QuantumStateGPU* state_out);
@@ -2518,6 +2536,80 @@ const char *subqg_agent_kernel_src =
 "        field_map[idx] = sin(phase[idx]) * local_energy;\n"
 "    }\n"
 "}\n";
+const char *sqse_kernel_src =
+"#pragma OPENCL EXTENSION cl_khr_fp64 : enable\n"
+"#define TWO_PI 6.283185307179586476925286766559f\n"
+"inline float wrap_2pi(float x) {\n"
+"    float y = fmod(x, TWO_PI);\n"
+"    return (y < 0.0f) ? (y + TWO_PI) : y;\n"
+"}\n"
+"inline float mask_from_key(float key, float lambda_field) {\n"
+"    float a = sin(key * 3.1415926535f + lambda_field * 0.5f);\n"
+"    float b = cos(key * 2.7182818284f - lambda_field * 1.6180339887f);\n"
+"    float c = a * b + sin((a - b) * 0.57721f + lambda_field);\n"
+"    float m = fmod(fabs(c) * 123.4567f, TWO_PI);\n"
+"    return m;\n"
+"}\n"
+"inline void stdmap_forward(float *theta, float *p, float K, int steps) {\n"
+"    float th = *theta;\n"
+"    float pp = *p;\n"
+"    for (int t = 0; t < steps; ++t) {\n"
+"        pp = wrap_2pi(pp + K * sin(th));\n"
+"        th = wrap_2pi(th + pp);\n"
+"    }\n"
+"    *theta = th;\n"
+"    *p = pp;\n"
+"}\n"
+"inline void stdmap_inverse(float *theta, float *p, float K, int steps) {\n"
+"    float th = *theta;\n"
+"    float pp = *p;\n"
+"    for (int t = 0; t < steps; ++t) {\n"
+"        float th_prev = wrap_2pi(th - pp);\n"
+"        float pp_prev = wrap_2pi(pp - K * sin(th_prev));\n"
+"        th = th_prev;\n"
+"        pp = pp_prev;\n"
+"    }\n"
+"    *theta = th;\n"
+"    *p = pp;\n"
+"}\n"
+"__kernel void sqse_encrypt(__global const float* data_in,\n"
+"                           __global const float* key,\n"
+"                           const float K,\n"
+"                           const int steps,\n"
+"                           __global float* out_theta,\n"
+"                           __global float* out_p_masked,\n"
+"                           const int n)\n"
+"{\n"
+"    int i = get_global_id(0);\n"
+"    if (i >= n) return;\n"
+"    float x = data_in[i];\n"
+"    float k = key[i];\n"
+"    float theta = fmod(fabs(x), 1.0f) * TWO_PI;\n"
+"    float p     = fmod(fabs(k), 1.0f) * TWO_PI;\n"
+"    stdmap_forward(&theta, &p, K, steps);\n"
+"    float mask = mask_from_key(k, K);\n"
+"    float p_masked = wrap_2pi(p + mask);\n"
+"    out_theta[i]    = theta / TWO_PI;\n"
+"    out_p_masked[i] = p_masked / TWO_PI;\n"
+"}\n"
+"__kernel void sqse_decrypt(__global const float* in_theta,\n"
+"                           __global const float* in_p_masked,\n"
+"                           __global const float* key,\n"
+"                           const float K,\n"
+"                           const int steps,\n"
+"                           __global float* data_out,\n"
+"                           const int n)\n"
+"{\n"
+"    int i = get_global_id(0);\n"
+"    if (i >= n) return;\n"
+"    float k = key[i];\n"
+"    float theta = fmod(fabs(in_theta[i]), 1.0f) * TWO_PI;\n"
+"    float p_m   = fmod(fabs(in_p_masked[i]), 1.0f) * TWO_PI;\n"
+"    float mask = mask_from_key(k, K);\n"
+"    float p = wrap_2pi(p_m - mask);\n"
+"    stdmap_inverse(&theta, &p, K, steps);\n"
+"    data_out[i] = theta / TWO_PI;\n"
+"}\n";
 const char *quantum_simulation_kernels_src =
 "inline float2 complex_add(float2 a, float2 b) { return (float2)(a.x + b.x, a.y + b.y); }\n"
 "inline float2 complex_sub(float2 a, float2 b) { return (float2)(a.x - b.x, a.y - b.y); }\n"
@@ -2836,6 +2928,40 @@ cl_int compile_opencl_kernel_dual(const char* kernel_source, const char* kernel_
     return CL_SUCCESS;
 }
 
+static int ensure_sqse_kernels_ready(void) {
+    if (sqse_program && sqse_encrypt_kernel && sqse_decrypt_kernel) {
+        return 1;
+    }
+    if (!context || !device_id) {
+        fprintf(stderr, "[C] SQSE: OpenCL context/device not initialized. Call initialize_gpu first.\n");
+        return 0;
+    }
+
+    cl_program program = NULL;
+    cl_kernel encrypt = NULL;
+    cl_int err = compile_opencl_kernel_variant(sqse_kernel_src, "sqse_encrypt", &program, &encrypt, 0);
+    if (err != CL_SUCCESS || !program || !encrypt) {
+        fprintf(stderr, "[C] SQSE: Failed to compile sqse_encrypt kernel: %s (%d)\n", clGetErrorString(err), err);
+        if (program) { clReleaseProgram(program); }
+        if (encrypt) { clReleaseKernel(encrypt); }
+        return 0;
+    }
+
+    cl_int derr = CL_SUCCESS;
+    cl_kernel decrypt = clCreateKernel(program, "sqse_decrypt", &derr);
+    if (derr != CL_SUCCESS || !decrypt) {
+        fprintf(stderr, "[C] SQSE: Failed to create sqse_decrypt kernel: %s (%d)\n", clGetErrorString(derr), derr);
+        clReleaseKernel(encrypt);
+        clReleaseProgram(program);
+        return 0;
+    }
+
+    sqse_program = program;
+    sqse_encrypt_kernel = encrypt;
+    sqse_decrypt_kernel = decrypt;
+    return 1;
+}
+
 /**
  * @brief Releases all allocated OpenCL resources.
  */
@@ -2919,6 +3045,8 @@ void shutdown_driver() {
     RELEASE_KERNEL(subqg_simulation_kernel);
     RELEASE_KERNEL(subqg_simulation_kernel_fast);
     RELEASE_KERNEL(subqg_agent_kernel);
+    RELEASE_KERNEL(sqse_encrypt_kernel);
+    RELEASE_KERNEL(sqse_decrypt_kernel);
     RELEASE_KERNEL(quantum_single_qubit_kernel);
     RELEASE_KERNEL(quantum_controlled_phase_kernel);
     RELEASE_KERNEL(quantum_controlled_not_kernel);
@@ -3009,6 +3137,7 @@ void shutdown_driver() {
     RELEASE_PROGRAM(subqg_simulation_program);
     RELEASE_PROGRAM(subqg_simulation_program_fast);
     RELEASE_PROGRAM(subqg_agent_program);
+    RELEASE_PROGRAM(sqse_program);
     RELEASE_PROGRAM(quantum_program);
     #undef RELEASE_PROGRAM
     printf("[C] shutdown_driver: Programs released.\n");
@@ -3636,6 +3765,12 @@ DLLEXPORT int initialize_gpu(int gpu_index) {
     if (compile_err != CL_SUCCESS || !subqg_agent_kernel) {
         fprintf(stderr, "[C] initialize_gpu: Failed to compile subqg agent kernel: %s (%d)\n",
                 clGetErrorString(compile_err), compile_err);
+        shutdown_driver();
+        return 0;
+    }
+    printf("[C] initialize_gpu: Compiling SQSE kernels...\n");
+    if (!ensure_sqse_kernels_ready()) {
+        fprintf(stderr, "[C] initialize_gpu: Failed to compile SQSE kernels.\n");
         shutdown_driver();
         return 0;
     }
@@ -8795,6 +8930,240 @@ DLLEXPORT int execute_shape_loss_with_reward_penalty_list_gpu(
         return 0;
     }
     return 1;
+}
+
+DLLEXPORT int sqse_load_kernels(const char* kernel_path) {
+    (void)kernel_path; // Kernel source embedded; path retained for API compatibility.
+    return ensure_sqse_kernels_ready() ? 0 : -1;
+}
+
+static int sqse_validate_common(const float* ptr, int n, const char* label) {
+    if (!ptr) {
+        fprintf(stderr, "[C] SQSE: Error - NULL pointer for %s.\n", label);
+        return -1;
+    }
+    if (n < 0) {
+        fprintf(stderr, "[C] SQSE: Error - Negative element count (%d).\n", n);
+        return -1;
+    }
+    return 0;
+}
+
+DLLEXPORT int execute_sqse_encrypt_float(const float* data_in,
+                                         const float* key,
+                                         int n,
+                                         float lambda_field,
+                                         int steps,
+                                         float* out_theta,
+                                         float* out_p_masked) {
+    if (sqse_validate_common(data_in, n, "data_in") < 0 ||
+        sqse_validate_common(key, n, "key") < 0 ||
+        sqse_validate_common(out_theta, n, "out_theta") < 0 ||
+        sqse_validate_common(out_p_masked, n, "out_p_masked") < 0) {
+        return -1;
+    }
+    if (n == 0) {
+        return 0;
+    }
+    if (steps < 0) {
+        fprintf(stderr, "[C] SQSE: Error - Negative iteration steps (%d).\n", steps);
+        return -1;
+    }
+    if (!context || !queue) {
+        fprintf(stderr, "[C] SQSE: Error - OpenCL context/queue not initialized. Call initialize_gpu first.\n");
+        return -2;
+    }
+    if (!ensure_sqse_kernels_ready()) {
+        return -3;
+    }
+
+    cl_int err = CL_SUCCESS;
+    size_t bytes = (size_t)n * sizeof(float);
+    cl_mem buf_data = clCreateBuffer(context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR, bytes, (void*)data_in, &err);
+    if (err != CL_SUCCESS || !buf_data) {
+        fprintf(stderr, "[C] SQSE Encrypt: clCreateBuffer data failed: %s (%d)\n", clGetErrorString(err), err);
+        return -4;
+    }
+    cl_mem buf_key = clCreateBuffer(context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR, bytes, (void*)key, &err);
+    if (err != CL_SUCCESS || !buf_key) {
+        fprintf(stderr, "[C] SQSE Encrypt: clCreateBuffer key failed: %s (%d)\n", clGetErrorString(err), err);
+        clReleaseMemObject(buf_data);
+        return -4;
+    }
+    cl_mem buf_theta = clCreateBuffer(context, CL_MEM_WRITE_ONLY, bytes, NULL, &err);
+    if (err != CL_SUCCESS || !buf_theta) {
+        fprintf(stderr, "[C] SQSE Encrypt: clCreateBuffer out_theta failed: %s (%d)\n", clGetErrorString(err), err);
+        clReleaseMemObject(buf_data);
+        clReleaseMemObject(buf_key);
+        return -4;
+    }
+    cl_mem buf_p_masked = clCreateBuffer(context, CL_MEM_WRITE_ONLY, bytes, NULL, &err);
+    if (err != CL_SUCCESS || !buf_p_masked) {
+        fprintf(stderr, "[C] SQSE Encrypt: clCreateBuffer out_p_masked failed: %s (%d)\n", clGetErrorString(err), err);
+        clReleaseMemObject(buf_data);
+        clReleaseMemObject(buf_key);
+        clReleaseMemObject(buf_theta);
+        return -4;
+    }
+
+    int arg_idx = 0;
+    err  = clSetKernelArg(sqse_encrypt_kernel, arg_idx++, sizeof(cl_mem), &buf_data);
+    err |= clSetKernelArg(sqse_encrypt_kernel, arg_idx++, sizeof(cl_mem), &buf_key);
+    err |= clSetKernelArg(sqse_encrypt_kernel, arg_idx++, sizeof(float), &lambda_field);
+    err |= clSetKernelArg(sqse_encrypt_kernel, arg_idx++, sizeof(int), &steps);
+    err |= clSetKernelArg(sqse_encrypt_kernel, arg_idx++, sizeof(cl_mem), &buf_theta);
+    err |= clSetKernelArg(sqse_encrypt_kernel, arg_idx++, sizeof(cl_mem), &buf_p_masked);
+    err |= clSetKernelArg(sqse_encrypt_kernel, arg_idx++, sizeof(int), &n);
+    if (err != CL_SUCCESS) {
+        fprintf(stderr, "[C] SQSE Encrypt: clSetKernelArg failed: %s (%d)\n", clGetErrorString(err), err);
+        clReleaseMemObject(buf_data);
+        clReleaseMemObject(buf_key);
+        clReleaseMemObject(buf_theta);
+        clReleaseMemObject(buf_p_masked);
+        return -5;
+    }
+
+    size_t global = (size_t)n;
+    err = clEnqueueNDRangeKernel(queue, sqse_encrypt_kernel, 1, NULL, &global, NULL, 0, NULL, NULL);
+    if (err != CL_SUCCESS) {
+        fprintf(stderr, "[C] SQSE Encrypt: clEnqueueNDRangeKernel failed: %s (%d)\n", clGetErrorString(err), err);
+        clReleaseMemObject(buf_data);
+        clReleaseMemObject(buf_key);
+        clReleaseMemObject(buf_theta);
+        clReleaseMemObject(buf_p_masked);
+        return -6;
+    }
+
+    err = clEnqueueReadBuffer(queue, buf_theta, CL_TRUE, 0, bytes, out_theta, 0, NULL, NULL);
+    if (err != CL_SUCCESS) {
+        fprintf(stderr, "[C] SQSE Encrypt: Read out_theta failed: %s (%d)\n", clGetErrorString(err), err);
+        clReleaseMemObject(buf_data);
+        clReleaseMemObject(buf_key);
+        clReleaseMemObject(buf_theta);
+        clReleaseMemObject(buf_p_masked);
+        return -7;
+    }
+    err = clEnqueueReadBuffer(queue, buf_p_masked, CL_TRUE, 0, bytes, out_p_masked, 0, NULL, NULL);
+    if (err != CL_SUCCESS) {
+        fprintf(stderr, "[C] SQSE Encrypt: Read out_p_masked failed: %s (%d)\n", clGetErrorString(err), err);
+        clReleaseMemObject(buf_data);
+        clReleaseMemObject(buf_key);
+        clReleaseMemObject(buf_theta);
+        clReleaseMemObject(buf_p_masked);
+        return -7;
+    }
+
+    clFinish(queue);
+
+    clReleaseMemObject(buf_data);
+    clReleaseMemObject(buf_key);
+    clReleaseMemObject(buf_theta);
+    clReleaseMemObject(buf_p_masked);
+    return 0;
+}
+
+DLLEXPORT int execute_sqse_decrypt_float(const float* in_theta,
+                                         const float* in_p_masked,
+                                         const float* key,
+                                         int n,
+                                         float lambda_field,
+                                         int steps,
+                                         float* data_out) {
+    if (sqse_validate_common(in_theta, n, "in_theta") < 0 ||
+        sqse_validate_common(in_p_masked, n, "in_p_masked") < 0 ||
+        sqse_validate_common(key, n, "key") < 0 ||
+        sqse_validate_common(data_out, n, "data_out") < 0) {
+        return -1;
+    }
+    if (n == 0) {
+        return 0;
+    }
+    if (steps < 0) {
+        fprintf(stderr, "[C] SQSE: Error - Negative iteration steps (%d).\n", steps);
+        return -1;
+    }
+    if (!context || !queue) {
+        fprintf(stderr, "[C] SQSE: Error - OpenCL context/queue not initialized. Call initialize_gpu first.\n");
+        return -2;
+    }
+    if (!ensure_sqse_kernels_ready()) {
+        return -3;
+    }
+
+    cl_int err = CL_SUCCESS;
+    size_t bytes = (size_t)n * sizeof(float);
+    cl_mem buf_theta = clCreateBuffer(context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR, bytes, (void*)in_theta, &err);
+    if (err != CL_SUCCESS || !buf_theta) {
+        fprintf(stderr, "[C] SQSE Decrypt: clCreateBuffer in_theta failed: %s (%d)\n", clGetErrorString(err), err);
+        return -4;
+    }
+    cl_mem buf_p_masked = clCreateBuffer(context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR, bytes, (void*)in_p_masked, &err);
+    if (err != CL_SUCCESS || !buf_p_masked) {
+        fprintf(stderr, "[C] SQSE Decrypt: clCreateBuffer in_p_masked failed: %s (%d)\n", clGetErrorString(err), err);
+        clReleaseMemObject(buf_theta);
+        return -4;
+    }
+    cl_mem buf_key = clCreateBuffer(context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR, bytes, (void*)key, &err);
+    if (err != CL_SUCCESS || !buf_key) {
+        fprintf(stderr, "[C] SQSE Decrypt: clCreateBuffer key failed: %s (%d)\n", clGetErrorString(err), err);
+        clReleaseMemObject(buf_theta);
+        clReleaseMemObject(buf_p_masked);
+        return -4;
+    }
+    cl_mem buf_out = clCreateBuffer(context, CL_MEM_WRITE_ONLY, bytes, NULL, &err);
+    if (err != CL_SUCCESS || !buf_out) {
+        fprintf(stderr, "[C] SQSE Decrypt: clCreateBuffer data_out failed: %s (%d)\n", clGetErrorString(err), err);
+        clReleaseMemObject(buf_theta);
+        clReleaseMemObject(buf_p_masked);
+        clReleaseMemObject(buf_key);
+        return -4;
+    }
+
+    int arg_idx = 0;
+    err  = clSetKernelArg(sqse_decrypt_kernel, arg_idx++, sizeof(cl_mem), &buf_theta);
+    err |= clSetKernelArg(sqse_decrypt_kernel, arg_idx++, sizeof(cl_mem), &buf_p_masked);
+    err |= clSetKernelArg(sqse_decrypt_kernel, arg_idx++, sizeof(cl_mem), &buf_key);
+    err |= clSetKernelArg(sqse_decrypt_kernel, arg_idx++, sizeof(float), &lambda_field);
+    err |= clSetKernelArg(sqse_decrypt_kernel, arg_idx++, sizeof(int), &steps);
+    err |= clSetKernelArg(sqse_decrypt_kernel, arg_idx++, sizeof(cl_mem), &buf_out);
+    err |= clSetKernelArg(sqse_decrypt_kernel, arg_idx++, sizeof(int), &n);
+    if (err != CL_SUCCESS) {
+        fprintf(stderr, "[C] SQSE Decrypt: clSetKernelArg failed: %s (%d)\n", clGetErrorString(err), err);
+        clReleaseMemObject(buf_theta);
+        clReleaseMemObject(buf_p_masked);
+        clReleaseMemObject(buf_key);
+        clReleaseMemObject(buf_out);
+        return -5;
+    }
+
+    size_t global = (size_t)n;
+    err = clEnqueueNDRangeKernel(queue, sqse_decrypt_kernel, 1, NULL, &global, NULL, 0, NULL, NULL);
+    if (err != CL_SUCCESS) {
+        fprintf(stderr, "[C] SQSE Decrypt: clEnqueueNDRangeKernel failed: %s (%d)\n", clGetErrorString(err), err);
+        clReleaseMemObject(buf_theta);
+        clReleaseMemObject(buf_p_masked);
+        clReleaseMemObject(buf_key);
+        clReleaseMemObject(buf_out);
+        return -6;
+    }
+
+    err = clEnqueueReadBuffer(queue, buf_out, CL_TRUE, 0, bytes, data_out, 0, NULL, NULL);
+    if (err != CL_SUCCESS) {
+        fprintf(stderr, "[C] SQSE Decrypt: Read data_out failed: %s (%d)\n", clGetErrorString(err), err);
+        clReleaseMemObject(buf_theta);
+        clReleaseMemObject(buf_p_masked);
+        clReleaseMemObject(buf_key);
+        clReleaseMemObject(buf_out);
+        return -7;
+    }
+
+    clFinish(queue);
+
+    clReleaseMemObject(buf_theta);
+    clReleaseMemObject(buf_p_masked);
+    clReleaseMemObject(buf_key);
+    clReleaseMemObject(buf_out);
+    return 0;
 }
 
 DLLEXPORT void set_noise_level(int gpu_index, float value) {
