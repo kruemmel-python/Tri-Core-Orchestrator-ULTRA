@@ -744,7 +744,7 @@ DLLEXPORT int sqse_load_kernels(const char* kernel_path);
 DLLEXPORT int execute_sqse_encrypt_float(const float* data_in,
                                          const float* key,
                                          int n,
-                                         float lambda_field,
+                                         float chaos_K,
                                          int steps,
                                          float* out_theta,
                                          float* out_p_masked);
@@ -752,7 +752,7 @@ DLLEXPORT int execute_sqse_decrypt_float(const float* in_theta,
                                          const float* in_p_masked,
                                          const float* key,
                                          int n,
-                                         float lambda_field,
+                                         float chaos_K,
                                          int steps,
                                          float* data_out);
 DLLEXPORT void set_noise_level(int gpu_index, float value);
@@ -8952,7 +8952,7 @@ static int sqse_validate_common(const float* ptr, int n, const char* label) {
 DLLEXPORT int execute_sqse_encrypt_float(const float* data_in,
                                          const float* key,
                                          int n,
-                                         float lambda_field,
+                                         float chaos_K,
                                          int steps,
                                          float* out_theta,
                                          float* out_p_masked) {
@@ -9009,7 +9009,7 @@ DLLEXPORT int execute_sqse_encrypt_float(const float* data_in,
     int arg_idx = 0;
     err  = clSetKernelArg(sqse_encrypt_kernel, arg_idx++, sizeof(cl_mem), &buf_data);
     err |= clSetKernelArg(sqse_encrypt_kernel, arg_idx++, sizeof(cl_mem), &buf_key);
-    err |= clSetKernelArg(sqse_encrypt_kernel, arg_idx++, sizeof(float), &lambda_field);
+    err |= clSetKernelArg(sqse_encrypt_kernel, arg_idx++, sizeof(float), &chaos_K);
     err |= clSetKernelArg(sqse_encrypt_kernel, arg_idx++, sizeof(int), &steps);
     err |= clSetKernelArg(sqse_encrypt_kernel, arg_idx++, sizeof(cl_mem), &buf_theta);
     err |= clSetKernelArg(sqse_encrypt_kernel, arg_idx++, sizeof(cl_mem), &buf_p_masked);
@@ -9066,7 +9066,7 @@ DLLEXPORT int execute_sqse_decrypt_float(const float* in_theta,
                                          const float* in_p_masked,
                                          const float* key,
                                          int n,
-                                         float lambda_field,
+                                         float chaos_K,
                                          int steps,
                                          float* data_out) {
     if (sqse_validate_common(in_theta, n, "in_theta") < 0 ||
@@ -9123,7 +9123,7 @@ DLLEXPORT int execute_sqse_decrypt_float(const float* in_theta,
     err  = clSetKernelArg(sqse_decrypt_kernel, arg_idx++, sizeof(cl_mem), &buf_theta);
     err |= clSetKernelArg(sqse_decrypt_kernel, arg_idx++, sizeof(cl_mem), &buf_p_masked);
     err |= clSetKernelArg(sqse_decrypt_kernel, arg_idx++, sizeof(cl_mem), &buf_key);
-    err |= clSetKernelArg(sqse_decrypt_kernel, arg_idx++, sizeof(float), &lambda_field);
+    err |= clSetKernelArg(sqse_decrypt_kernel, arg_idx++, sizeof(float), &chaos_K);
     err |= clSetKernelArg(sqse_decrypt_kernel, arg_idx++, sizeof(int), &steps);
     err |= clSetKernelArg(sqse_decrypt_kernel, arg_idx++, sizeof(cl_mem), &buf_out);
     err |= clSetKernelArg(sqse_decrypt_kernel, arg_idx++, sizeof(int), &n);
