@@ -86,7 +86,13 @@ streamlit run streamlit_tri_core_ultra.py
 | Speicherbedarf | < 300 MB | Inklusive PCA + Feldkarten |
 
 ---
+## 📈 Lernverlauf und PCA-Analyse (BioCortex-Modul)
 
+Die folgende Animation zeigt die Projektion der Prototyp-Aktivierungen über 10 Epochen mittels Hauptkomponentenanalyse (PCA).  
+Man erkennt deutlich, wie sich die Cluster im SubQG-Feld anordnen und stabilisieren – ein Indikator für kohärentes, energieeffizientes Lernen.
+
+![PCA Trajektorien](pca_trajectory.gif)
+---
 ## 🧠 Fazit (🇩🇪)
 Der Treiber beweist, dass **OpenCL** – richtig eingesetzt – selbst auf älteren APUs eine Plattform für hybride klassische und quanteninspirierte Lernprozesse bieten kann.  
 Er kombiniert Tensoroperationen, Feldsimulation und quantenlogische Prozesse in einer **einheitlichen GPU-Schicht**.
