@@ -100,3 +100,21 @@ It bridges tensor computation, field simulation, and quantum logic in a single c
 **Repository:** [Tri-Core Orchestrator ULTRA](https://github.com/kruemmel-python/Tri-Core-Orchestrator-ULTRA)  
 **Author:** Ralf Krümmel  
 **License:** MIT  
+
+---
+
+## ⚙️ Erweiterte Liste der GPU-Kernel
+
+| Kategorie | Kernel / Funktion | Beschreibung (🇩🇪) | Description (🇬🇧) |
+| :--- | :--- | :--- | :--- |
+| **Tensor / DL (Core)** | `matrix_multiply`, `softmax_rowwise`, `layer_norm`, `gelu_elementwise`, `add_elementwise`, `mul_elementwise`, `log_softmax_stable_rowwise`, `add_broadcast_pe`, `add_bias_mn`, `pairwise_similarity_dot`, `embedding_lookup` | Kernoperatoren für allgemeine lineare Algebra, Aktivierungen und Normalisierung in neuronalen Netzen. | Core operators for general linear algebra, activations, and normalization in neural networks. |
+| **Tensor / DL (Backward)** | `gelu_backward_elementwise`, `matmul_backward_da`, `matmul_backward_db`, `layer_norm_backward`, `softmax_backward`, `mul_backward`, `transpose_backward`, `reduce_sum_axis01`, `embedding_backward_calc_delta_local` | Berechnung der Gradienten (dA, dB, dX) für die Kernoperatoren und Bias-Gradienten. | Gradient computation (dA, dB, dX) for core operators and bias gradients. |
+| **Tensor / DL (Batched/Reshape)** | `transpose`, `transpose_batched_last_two`, `transpose_12_batched`, `matmul_batched`, `matmul_batched_backward_da`, `matmul_batched_backward_db` | Operatoren für das Umschichten und die Matrixmultiplikation von Batched-Tensoren (z. B. in Multi-Head-Attention). | Operators for reshaping and matrix multiplication of batched tensors (e.g., in multi-head attention). |
+| **Optimierung / Learning** | `adam_update`, `hebbian_update_local_reduce`, `proto_segmented_sum_atomic`, `proto_update_step` | Lernkerne für Gewichtsaktualisierung (Adam, Hebbian) und Prototyp-basierte Modellaktualisierungen. | Learning kernels for weight updates (Adam, Hebbian) and prototype-based model updates. |
+| **Specialized NN / Hybrid** | `threshold_spike`, `dynamic_token_assignment` | Kernel für die Erzeugung binärer Spikes und die Zuweisung von Aktivierungen zu Prototypen/Tokens. | Kernels for generating binary spikes and assigning activations to prototypes/tokens. |
+| **Loss / Metrics** | `cross_entropy_loss_grad`, `shape_loss_reward_penalty`, `shape_loss_reward_penalty_list` | Berechnung von Cross-Entropy-Verlust und Gradienten sowie spezialisierte Verlustformung (Shaping). | Calculation of cross-entropy loss and gradients, and specialized loss shaping. |
+| **SubQG / Feld** | `subqg_simulation_step`, `subqg_inject_agents` | Simulation der lokalen Energie- und Phasenfelder (Myzel-inspiriert) und Agenten-Interaktion. | Simulation of local energy and phase fields (mycelial-inspired) and agent interaction. |
+| **Quantum (Low-Level Gates)** | `quantum_apply_single_qubit`, `quantum_apply_controlled_phase`, `quantum_apply_controlled_not`, `quantum_swap_qubits` | Elementare Operationen (Gatter) auf Qubit-Zustandsvektoren. | Elementary operations (gates) on qubit state vectors. |
+| **Quantum (Algorithm Components)**| `quantum_phase_oracle`, `quantum_phase_flip_except_zero`, `quantum_modular_exponentiation` | Spezifische Phasen- und Arithmetik-Kernel für Algorithmen (z.B. Grover, Shor). | Specific phase and arithmetic kernels for algorithms (e.g., Grover, Shor). |
+| **Quantum (Measurement/VQE)**| `quantum_compute_probabilities`, `quantum_expectation_pauli_z` | Berechung von Wahrscheinlichkeiten und Erwartungswerten (Pauli Z-Basis) für Messungen. | Calculation of probabilities and expectation values (Pauli Z-basis) for measurements. |
+| **Cryptography** | `sqse_encrypt`, `sqse_decrypt` | Symmetrische Sequenz-Entropie (SQSE) Verschlüsselungs-/Entschlüsselungskerne. | Symmetric Sequence Entropy (SQSE) encryption/decryption kernels. |
