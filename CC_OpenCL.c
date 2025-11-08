@@ -349,6 +349,20 @@ cl_program fused_diffusion_program = NULL;        cl_kernel fused_diffusion_kern
 cl_program fused_diffusion_program_fast = NULL;
 cl_kernel fused_diffusion_kernel_fast = NULL;
 static unsigned int g_rng_seed = 0; // Einfacher Zähler für den RNG-Seed
+cl_program izhikevich_program = NULL;           cl_kernel izhikevich_kernel = NULL;
+cl_program izhikevich_program_fast = NULL;      cl_kernel izhikevich_kernel_fast = NULL;
+cl_program stdp_update_program = NULL;          cl_kernel stdp_update_kernel = NULL;
+cl_program stdp_update_program_fast = NULL;     cl_kernel stdp_update_kernel_fast = NULL;
+cl_program stdp_trace_program = NULL;           cl_kernel stdp_trace_kernel = NULL;
+cl_program stdp_trace_program_fast = NULL;      cl_kernel stdp_trace_kernel_fast = NULL;
+cl_program lbm_program = NULL;                  cl_kernel lbm_kernel = NULL;
+cl_program lbm_program_fast = NULL;             cl_kernel lbm_kernel_fast = NULL;
+cl_program nbody_forces_program = NULL;         cl_kernel nbody_forces_kernel = NULL;
+cl_program nbody_forces_program_fast = NULL;    cl_kernel nbody_forces_kernel_fast = NULL;
+cl_program nbody_integrate_program = NULL;      cl_kernel nbody_integrate_kernel = NULL;
+cl_program nbody_integrate_program_fast = NULL; cl_kernel nbody_integrate_kernel_fast = NULL;
+cl_program ising_program = NULL;                cl_kernel ising_kernel = NULL;
+cl_program ising_program_fast = NULL;           cl_kernel ising_kernel_fast = NULL;
 cl_program hebbian_update_local_reduce_program = NULL; cl_kernel hebbian_update_local_reduce_kernel = NULL;
 cl_program hebbian_update_local_reduce_program_fast = NULL;
 cl_kernel hebbian_update_local_reduce_kernel_fast = NULL;
@@ -923,7 +937,14 @@ typedef enum {
     COMMAND_PROTO_UPDATE_STEP = 35,             /**< Update prototypes using accumulated sums and counts from segmented sum. */
     COMMAND_SHAPE_LOSS_REWARD_PENALTY = 36,     /**< Adjust loss based on reward/penalty rules (single pair). */
     COMMAND_SHAPE_LOSS_REWARD_PENALTY_LIST = 37,/**< Adjust loss based on reward/penalty rules (list of pairs). */ // NEU
-    COMMAND_FUSED_DIFFUSION = 38                /**< Diffusion step combining self-retention and weighted neighbor aggregation. */
+    COMMAND_FUSED_DIFFUSION = 38,               /**< Diffusion step combining self-retention and weighted neighbor aggregation. */
+    COMMAND_IZHIKEVICH_STEP = 39,               /**< Advance Izhikevich neuron dynamics for one time step. */
+    COMMAND_STDP_UPDATE = 40,                   /**< Apply spike-timing-dependent plasticity weight updates. */
+    COMMAND_STDP_TRACE_UPDATE = 41,             /**< Decay and refresh STDP spike traces. */
+    COMMAND_LBM_COLLIDE_STREAM = 42,            /**< Perform a Lattice-Boltzmann collide-and-stream step (D2Q9). */
+    COMMAND_NBODY_FORCES = 43,                  /**< Compute pairwise gravitational forces for N-body simulation. */
+    COMMAND_NBODY_INTEGRATE = 44,               /**< Integrate N-body positions and velocities from computed forces. */
+    COMMAND_ISING_METROPOLIS = 45               /**< Metropolis update for checkerboard Ising simulation step. */
 } GPUCommand;
 
 // --- Forward Declarations for Exported Functions ---
@@ -973,6 +994,14 @@ DLLEXPORT int execute_proto_update_step_gpu(int gpu_index, void* prototypes, voi
 // Loss Shaping Exports
 DLLEXPORT int execute_shape_loss_with_reward_penalty_gpu(int gpu_index, void* loss_per_sample_in, void* predictions, void* targets, void* loss_per_sample_out, int num_samples, int num_classes, float penalty_weight, float reward_weight, float high_confidence_threshold, int critical_target_class, int critical_predicted_class);
 DLLEXPORT int execute_shape_loss_with_reward_penalty_list_gpu(int gpu_index, void* loss_per_sample_in, void* predictions, void* targets, void* loss_per_sample_out, void* critical_pairs, int num_samples, int num_classes, int num_critical_pairs, float penalty_weight, float reward_weight, float high_confidence_threshold); // NEU
+DLLEXPORT int execute_fused_diffusion_on_gpu(int gpu_index, void* buffer_X, void* buffer_W, void* buffer_O, int B, int N, int D, float gamma, float sigma);
+DLLEXPORT int execute_izhikevich_step_on_gpu(int gpu_index, void* v, void* u, void* i_inj, void* spikes_out, void* p_a, void* p_b, void* p_c, void* p_d, float dt, float threshold, int num_neurons);
+DLLEXPORT int execute_stdp_update_on_gpu(int gpu_index, void* weights, void* pre_traces, void* post_traces, void* pre_spike_events, void* post_spike_events, float lr_ltp, float lr_ltd, int pre_n, int post_n);
+DLLEXPORT int execute_stdp_trace_update_on_gpu(int gpu_index, void* pre_traces, void* post_traces, void* pre_spike_events, void* post_spike_events, float decay_pre, float decay_post, float increment_pre, float increment_post, int pre_n, int post_n);
+DLLEXPORT int execute_lbm_collide_and_stream_on_gpu(int gpu_index, void* f_in, void* f_out, void* rho, void* ux, void* uy, float omega, int width, int height);
+DLLEXPORT int execute_nbody_calculate_forces_on_gpu(int gpu_index, void* positions, void* forces, float gravitational_const, float softening_factor, int num_bodies);
+DLLEXPORT int execute_nbody_integrate_on_gpu(int gpu_index, void* positions, void* velocities, void* forces, float dt, int num_bodies);
+DLLEXPORT int execute_ising_metropolis_step_on_gpu(int gpu_index, void* spin_grid, void* random_numbers, float J, float beta, int width, int height, int color);
 DLLEXPORT int sqse_load_kernels(const char* kernel_path);
 DLLEXPORT int execute_sqse_encrypt_float(const float* data_in,
                                          const float* key,
@@ -2466,6 +2495,240 @@ const char *fused_diffusion_kernel_src =
 "    FP_TYPE one_minus_gamma = 1.0f - gamma;\n"
 "    O[x_idx] = one_minus_gamma * self_val + gamma * mix + noise;\n"
 "}\n";
+
+const char *izhikevich_kernel_src =
+"/* Simuliert einen Zeitschritt des Izhikevich-Neuronmodells mit Heun-Integration. */\n"
+"__kernel void izhikevich_neuron_step(\n"
+"    __global FP_TYPE *v,\n"
+"    __global FP_TYPE *u,\n"
+"    __global const FP_TYPE *i_inj,\n"
+"    __global FP_TYPE *spikes_out,\n"
+"    __global const FP_TYPE *p_a,\n"
+"    __global const FP_TYPE *p_b,\n"
+"    __global const FP_TYPE *p_c,\n"
+"    __global const FP_TYPE *p_d,\n"
+"    const FP_TYPE dt,\n"
+"    const FP_TYPE threshold,\n"
+"    const int num_neurons) {\n"
+"    int gid = get_global_id(0);\n"
+"    if (gid >= num_neurons) { return; }\n"
+"    FP_TYPE v_local = v[gid];\n"
+"    FP_TYPE u_local = u[gid];\n"
+"    const FP_TYPE a = p_a[gid];\n"
+"    const FP_TYPE b = p_b[gid];\n"
+"    const FP_TYPE c = p_c[gid];\n"
+"    const FP_TYPE d = p_d[gid];\n"
+"    const FP_TYPE input = i_inj[gid];\n"
+"    const FP_TYPE half_dt = dt * (FP_TYPE)0.5;\n"
+"    for (int step = 0; step < 2; ++step) {\n"
+"        FP_TYPE dv = (FP_TYPE)0.04 * v_local * v_local + (FP_TYPE)5.0 * v_local + (FP_TYPE)140.0 - u_local + input;\n"
+"        FP_TYPE du = a * (b * v_local - u_local);\n"
+"        v_local += half_dt * dv;\n"
+"        u_local += half_dt * du;\n"
+"    }\n"
+"    FP_TYPE spiked = (v_local >= threshold) ? (FP_TYPE)1 : (FP_TYPE)0;\n"
+"    if (spiked > (FP_TYPE)0) {\n"
+"        v_local = c;\n"
+"        u_local += d;\n"
+"    }\n"
+"    v[gid] = v_local;\n"
+"    u[gid] = u_local;\n"
+"    if (spikes_out) {\n"
+"        spikes_out[gid] = spiked;\n"
+"    }\n"
+"}\n";
+
+const char *stdp_update_kernel_src =
+"/* Wendet STDP-Gewichtsaktualisierungen basierend auf Spike-Traces an. */\n"
+"__kernel void stdp_update_step(\n"
+"    __global FP_TYPE *weights,\n"
+"    __global const FP_TYPE *pre_traces,\n"
+"    __global const FP_TYPE *post_traces,\n"
+"    __global const int *pre_spike_events,\n"
+"    __global const int *post_spike_events,\n"
+"    const FP_TYPE lr_ltp,\n"
+"    const FP_TYPE lr_ltd,\n"
+"    const int pre_n,\n"
+"    const int post_n) {\n"
+"    int gid = get_global_id(0);\n"
+"    int total = pre_n * post_n;\n"
+"    if (gid >= total) { return; }\n"
+"    int pre_idx = gid / post_n;\n"
+"    int post_idx = gid - pre_idx * post_n;\n"
+"    FP_TYPE w = weights[gid];\n"
+"    if (post_spike_events[post_idx] != 0) {\n"
+"        w += lr_ltp * pre_traces[pre_idx];\n"
+"    }\n"
+"    if (pre_spike_events[pre_idx] != 0) {\n"
+"        w -= lr_ltd * post_traces[post_idx];\n"
+"    }\n"
+"    weights[gid] = w;\n"
+"}\n";
+
+const char *stdp_trace_kernel_src =
+"/* Aktualisiert exponentiell abfallende Spike-Traces für STDP. */\n"
+"__kernel void stdp_update_traces(\n"
+"    __global FP_TYPE *pre_traces,\n"
+"    __global FP_TYPE *post_traces,\n"
+"    __global const int *pre_spike_events,\n"
+"    __global const int *post_spike_events,\n"
+"    const FP_TYPE decay_pre,\n"
+"    const FP_TYPE decay_post,\n"
+"    const FP_TYPE increment_pre,\n"
+"    const FP_TYPE increment_post,\n"
+"    const int pre_n,\n"
+"    const int post_n) {\n"
+"    int gid = get_global_id(0);\n"
+"    int max_n = pre_n > post_n ? pre_n : post_n;\n"
+"    if (gid >= max_n) { return; }\n"
+"    if (gid < pre_n) {\n"
+"        FP_TYPE trace = pre_traces[gid] * decay_pre;\n"
+"        if (pre_spike_events[gid] != 0) {\n"
+"            trace += increment_pre;\n"
+"        }\n"
+"        pre_traces[gid] = trace;\n"
+"    }\n"
+"    if (gid < post_n) {\n"
+"        FP_TYPE trace = post_traces[gid] * decay_post;\n"
+"        if (post_spike_events[gid] != 0) {\n"
+"            trace += increment_post;\n"
+"        }\n"
+"        post_traces[gid] = trace;\n"
+"    }\n"
+"}\n";
+
+const char *lbm_kernel_src =
+"/* Führt Kollision und Streaming für ein D2Q9-Lattice-Boltzmann-Gitter aus. */\n"
+"__kernel void lbm_collide_and_stream(\n"
+"    __global const FP_TYPE *f_in,\n"
+"    __global FP_TYPE *f_out,\n"
+"    __global FP_TYPE *rho,\n"
+"    __global FP_TYPE *ux,\n"
+"    __global FP_TYPE *uy,\n"
+"    const FP_TYPE omega,\n"
+"    const int width,\n"
+"    const int height) {\n"
+"    int gid = get_global_id(0);\n"
+"    int total = width * height;\n"
+"    if (gid >= total) { return; }\n"
+"    int x = gid % width;\n"
+"    int y = gid / width;\n"
+"    int base = gid * 9;\n"
+"    FP_TYPE fi[9];\n"
+"    for (int i = 0; i < 9; ++i) { fi[i] = f_in[base + i]; }\n"
+"    FP_TYPE rho_local = (FP_TYPE)0;\n"
+"    for (int i = 0; i < 9; ++i) { rho_local += fi[i]; }\n"
+"    FP_TYPE ux_local = (fi[1] - fi[3] + fi[5] - fi[6] - fi[7] + fi[8]) / rho_local;\n"
+"    FP_TYPE uy_local = (fi[2] - fi[4] + fi[5] + fi[6] - fi[7] - fi[8]) / rho_local;\n"
+"    rho[gid] = rho_local;\n"
+"    ux[gid] = ux_local;\n"
+"    uy[gid] = uy_local;\n"
+"    FP_TYPE u2 = ux_local * ux_local + uy_local * uy_local;\n"
+"    const FP_TYPE w[9] = {\n"
+"        (FP_TYPE)(4.0f/9.0f),\n"
+"        (FP_TYPE)(1.0f/9.0f), (FP_TYPE)(1.0f/9.0f), (FP_TYPE)(1.0f/9.0f), (FP_TYPE)(1.0f/9.0f),\n"
+"        (FP_TYPE)(1.0f/36.0f), (FP_TYPE)(1.0f/36.0f), (FP_TYPE)(1.0f/36.0f), (FP_TYPE)(1.0f/36.0f)\n"
+"    };\n"
+"    const int cx[9] = {0, 1, 0, -1, 0, 1, -1, -1, 1};\n"
+"    const int cy[9] = {0, 0, 1, 0, -1, 1, 1, -1, -1};\n"
+"    FP_TYPE feq[9];\n"
+"    for (int i = 0; i < 9; ++i) {\n"
+"        FP_TYPE cu = (FP_TYPE)3.0 * (cx[i] * ux_local + cy[i] * uy_local);\n"
+"        feq[i] = w[i] * rho_local * ((FP_TYPE)1 + cu + (FP_TYPE)0.5 * cu * cu - (FP_TYPE)1.5 * u2);\n"
+"    }\n"
+"    FP_TYPE post[9];\n"
+"    for (int i = 0; i < 9; ++i) {\n"
+"        post[i] = fi[i] - omega * (fi[i] - feq[i]);\n"
+"    }\n"
+"    for (int i = 0; i < 9; ++i) {\n"
+"        int nx = (x + cx[i] + width) % width;\n"
+"        int ny = (y + cy[i] + height) % height;\n"
+"        int dest = (ny * width + nx) * 9 + i;\n"
+"        f_out[dest] = post[i];\n"
+"    }\n"
+"}\n";
+
+const char *nbody_forces_kernel_src =
+"/* Berechnet Gravitationskräfte für jedes Teilchen im N-Körper-System. */\n"
+"__kernel void nbody_calculate_forces(\n"
+"    __global const float4 *positions,\n"
+"    __global float4 *forces,\n"
+"    const FP_TYPE gravitational_const,\n"
+"    const FP_TYPE softening_factor,\n"
+"    const int num_bodies) {\n"
+"    int gid = get_global_id(0);\n"
+"    if (gid >= num_bodies) { return; }\n"
+"    float4 pos_i = positions[gid];\n"
+"    float3 force = (float3)(0.0f, 0.0f, 0.0f);\n"
+"    for (int j = 0; j < num_bodies; ++j) {\n"
+"        float4 pos_j = positions[j];\n"
+"        float3 r = (float3)(pos_j.x - pos_i.x, pos_j.y - pos_i.y, pos_j.z - pos_i.z);\n"
+"        float dist2 = dot(r, r) + (float)softening_factor;\n"
+"        if (dist2 > 0.0f) {\n"
+"            float invDist = rsqrt(dist2);\n"
+"            float invDist3 = invDist * invDist * invDist;\n"
+"            float scale = (float)gravitational_const * pos_j.w * invDist3;\n"
+"            force += r * scale;\n"
+"        }\n"
+"    }\n"
+"    forces[gid] = (float4)(force.x, force.y, force.z, 0.0f);\n"
+"}\n";
+
+const char *nbody_integrate_kernel_src =
+"/* Integriert Positionen und Geschwindigkeiten anhand der berechneten Kräfte. */\n"
+"__kernel void nbody_integrate(\n"
+"    __global float4 *positions,\n"
+"    __global float4 *velocities,\n"
+"    __global const float4 *forces,\n"
+"    const FP_TYPE dt,\n"
+"    const int num_bodies) {\n"
+"    int gid = get_global_id(0);\n"
+"    if (gid >= num_bodies) { return; }\n"
+"    float4 pos = positions[gid];\n"
+"    float4 vel = velocities[gid];\n"
+"    float4 force = forces[gid];\n"
+"    FP_TYPE mass = pos.w > (FP_TYPE)0 ? pos.w : (FP_TYPE)1;\n"
+"    FP_TYPE inv_mass = (FP_TYPE)1 / mass;\n"
+"    vel.x += force.x * (float)(inv_mass * dt);\n"
+"    vel.y += force.y * (float)(inv_mass * dt);\n"
+"    vel.z += force.z * (float)(inv_mass * dt);\n"
+"    pos.x += vel.x * (float)dt;\n"
+"    pos.y += vel.y * (float)dt;\n"
+"    pos.z += vel.z * (float)dt;\n"
+"    positions[gid] = pos;\n"
+"    velocities[gid] = vel;\n"
+"}\n";
+
+const char *ising_kernel_src =
+"/* Führt einen Checkerboard-Metropolis-Schritt für das 2D-Ising-Modell aus. */\n"
+"__kernel void ising_metropolis_step(\n"
+"    __global int *spin_grid,\n"
+"    __global const FP_TYPE *random_numbers,\n"
+"    const FP_TYPE J,\n"
+"    const FP_TYPE beta,\n"
+"    const int width,\n"
+"    const int height,\n"
+"    const int color) {\n"
+"    int gid = get_global_id(0);\n"
+"    int total = width * height;\n"
+"    if (gid >= total) { return; }\n"
+"    int x = gid % width;\n"
+"    int y = gid / width;\n"
+"    if (((x + y) & 1) != (color & 1)) { return; }\n"
+"    int idx = y * width + x;\n"
+"    int up = spin_grid[((y + 1) % height) * width + x];\n"
+"    int down = spin_grid[((y - 1 + height) % height) * width + x];\n"
+"    int left = spin_grid[y * width + ((x - 1 + width) % width)];\n"
+"    int right = spin_grid[y * width + ((x + 1) % width)];\n"
+"    int spin = spin_grid[idx];\n"
+"    int neighbor_sum = up + down + left + right;\n"
+"    FP_TYPE deltaE = (FP_TYPE)2 * J * (FP_TYPE)spin * (FP_TYPE)neighbor_sum;\n"
+"    int rand_idx = idx >> 1;\n"
+"    FP_TYPE rnd = random_numbers[rand_idx];\n"
+"    if (deltaE <= (FP_TYPE)0 || rnd < exp(-beta * deltaE)) {\n"
+"        spin_grid[idx] = -spin;\n"
+"    }\n"
+"}\n";
 // GPU Prototype Update Kernel Sources
 const char *proto_segmented_sum_atomic_kernel_src =
 "/* This kernel requires the cl_khr_global_int32_base_atomics extension */\n"
@@ -3398,6 +3661,20 @@ void shutdown_driver() {
     RELEASE_KERNEL(pairwise_similarity_kernel_fast);
     RELEASE_KERNEL(fused_diffusion_kernel);
     RELEASE_KERNEL(fused_diffusion_kernel_fast);
+    RELEASE_KERNEL(izhikevich_kernel);
+    RELEASE_KERNEL(izhikevich_kernel_fast);
+    RELEASE_KERNEL(stdp_update_kernel);
+    RELEASE_KERNEL(stdp_update_kernel_fast);
+    RELEASE_KERNEL(stdp_trace_kernel);
+    RELEASE_KERNEL(stdp_trace_kernel_fast);
+    RELEASE_KERNEL(lbm_kernel);
+    RELEASE_KERNEL(lbm_kernel_fast);
+    RELEASE_KERNEL(nbody_forces_kernel);
+    RELEASE_KERNEL(nbody_forces_kernel_fast);
+    RELEASE_KERNEL(nbody_integrate_kernel);
+    RELEASE_KERNEL(nbody_integrate_kernel_fast);
+    RELEASE_KERNEL(ising_kernel);
+    RELEASE_KERNEL(ising_kernel_fast);
     RELEASE_KERNEL(hebbian_update_local_reduce_kernel);
     RELEASE_KERNEL(hebbian_update_local_reduce_kernel_fast);
     RELEASE_KERNEL(embedding_backward_calc_delta_local_kernel);
@@ -3495,6 +3772,20 @@ void shutdown_driver() {
     RELEASE_PROGRAM(pairwise_similarity_program_fast);
     RELEASE_PROGRAM(fused_diffusion_program);
     RELEASE_PROGRAM(fused_diffusion_program_fast);
+    RELEASE_PROGRAM(izhikevich_program);
+    RELEASE_PROGRAM(izhikevich_program_fast);
+    RELEASE_PROGRAM(stdp_update_program);
+    RELEASE_PROGRAM(stdp_update_program_fast);
+    RELEASE_PROGRAM(stdp_trace_program);
+    RELEASE_PROGRAM(stdp_trace_program_fast);
+    RELEASE_PROGRAM(lbm_program);
+    RELEASE_PROGRAM(lbm_program_fast);
+    RELEASE_PROGRAM(nbody_forces_program);
+    RELEASE_PROGRAM(nbody_forces_program_fast);
+    RELEASE_PROGRAM(nbody_integrate_program);
+    RELEASE_PROGRAM(nbody_integrate_program_fast);
+    RELEASE_PROGRAM(ising_program);
+    RELEASE_PROGRAM(ising_program_fast);
     RELEASE_PROGRAM(hebbian_update_local_reduce_program);
     RELEASE_PROGRAM(hebbian_update_local_reduce_program_fast);
     RELEASE_PROGRAM(embedding_backward_calc_delta_local_program);
@@ -4125,6 +4416,13 @@ DLLEXPORT int initialize_gpu(int gpu_index) {
     COMPILE_KERNEL_DUAL(dynamic_token_assign_kernel_src, "dynamic_token_assignment", dynamic_token_assign);
     COMPILE_KERNEL_DUAL(pairwise_similarity_kernel_src, "pairwise_similarity_dot", pairwise_similarity);
     COMPILE_KERNEL_DUAL(fused_diffusion_kernel_src, "fused_diffusion", fused_diffusion);
+    COMPILE_KERNEL_DUAL(izhikevich_kernel_src, "izhikevich_neuron_step", izhikevich);
+    COMPILE_KERNEL_DUAL(stdp_update_kernel_src, "stdp_update_step", stdp_update);
+    COMPILE_KERNEL_DUAL(stdp_trace_kernel_src, "stdp_update_traces", stdp_trace);
+    COMPILE_KERNEL_DUAL(lbm_kernel_src, "lbm_collide_and_stream", lbm);
+    COMPILE_KERNEL_DUAL(nbody_forces_kernel_src, "nbody_calculate_forces", nbody_forces);
+    COMPILE_KERNEL_DUAL(nbody_integrate_kernel_src, "nbody_integrate", nbody_integrate);
+    COMPILE_KERNEL_DUAL(ising_kernel_src, "ising_metropolis_step", ising);
     COMPILE_KERNEL_DUAL(hebbian_update_local_reduce_kernel_src, "hebbian_update_local_reduce", hebbian_update_local_reduce);
     COMPILE_KERNEL_DUAL(embedding_backward_calc_delta_local_kernel_src, "embedding_backward_calc_delta_local", embedding_backward_calc_delta_local);
     COMPILE_KERNEL_DUAL(proto_segmented_sum_atomic_kernel_src, "proto_segmented_sum_atomic", proto_segmented_sum);
@@ -6948,6 +7246,75 @@ typedef struct {
     float sigma;
 } FusedDiffusionCommandData;
 typedef struct {
+    void* v;
+    void* u;
+    void* i_inj;
+    void* spikes_out;
+    void* p_a;
+    void* p_b;
+    void* p_c;
+    void* p_d;
+    float dt;
+    float threshold;
+    int num_neurons;
+} IzhikevichCommandData;
+typedef struct {
+    void* weights;
+    void* pre_traces;
+    void* post_traces;
+    void* pre_spike_events;
+    void* post_spike_events;
+    float lr_ltp;
+    float lr_ltd;
+    int pre_n;
+    int post_n;
+} STDPUpdateCommandData;
+typedef struct {
+    void* pre_traces;
+    void* post_traces;
+    void* pre_spike_events;
+    void* post_spike_events;
+    float decay_pre;
+    float decay_post;
+    float increment_pre;
+    float increment_post;
+    int pre_n;
+    int post_n;
+} STDPTraceCommandData;
+typedef struct {
+    void* f_in;
+    void* f_out;
+    void* rho;
+    void* ux;
+    void* uy;
+    float omega;
+    int width;
+    int height;
+} LBMCollideStreamCommandData;
+typedef struct {
+    void* positions;
+    void* forces;
+    float gravitational_const;
+    float softening_factor;
+    int num_bodies;
+} NBodyForcesCommandData;
+typedef struct {
+    void* positions;
+    void* velocities;
+    void* forces;
+    float dt;
+    int num_bodies;
+} NBodyIntegrateCommandData;
+typedef struct {
+    void* spin_grid;
+    void* random_numbers;
+    float J;
+    float beta;
+    int width;
+    int height;
+    int color;
+} IsingMetropolisCommandData;
+typedef struct {
     void* activations_flat; void* indices_flat; void* proto_sums; void* proto_counts;
     int M_flat; int E; int T;
 } ProtoSegmentedSumCommandData;
@@ -8965,6 +9332,221 @@ int submit_kernel_command(int gpu_index, GPUCommand command, void *data) {
             CHECK_CL_ERR(ENQUEUE_KERNEL_PROFILED(kernel, 1, gws, NULL, "fused_diffusion"), "FusedDiffusion Enqueue");
             return 1;
         }
+        case COMMAND_IZHIKEVICH_STEP: {
+            IzhikevichCommandData* cmd = (IzhikevichCommandData*)data;
+            if ((!izhikevich_kernel && !izhikevich_kernel_fast) || !cmd || !cmd->v || !cmd->u || !cmd->i_inj || !cmd->spikes_out ||
+                !cmd->p_a || !cmd->p_b || !cmd->p_c || !cmd->p_d) {
+                fprintf(stderr, "[C] Submit Izhikevich: Invalid args or kernel.\n");
+                return 0;
+            }
+            if (cmd->num_neurons <= 0) {
+                if (cmd->num_neurons == 0) { return 1; }
+                fprintf(stderr, "[C] Submit Izhikevich: Invalid neuron count (%d).\n", cmd->num_neurons);
+                return 0;
+            }
+            if (cmd->dt <= 0.0f) {
+                fprintf(stderr, "[C] Submit Izhikevich: Invalid dt (%f).\n", cmd->dt);
+                return 0;
+            }
+            cl_kernel kernel = izhikevich_kernel_fast ? izhikevich_kernel_fast : izhikevich_kernel;
+            cl_mem v_mem = (cl_mem)cmd->v;
+            cl_mem u_mem = (cl_mem)cmd->u;
+            cl_mem inj_mem = (cl_mem)cmd->i_inj;
+            cl_mem spikes_mem = (cl_mem)cmd->spikes_out;
+            cl_mem a_mem = (cl_mem)cmd->p_a;
+            cl_mem b_mem = (cl_mem)cmd->p_b;
+            cl_mem c_mem = (cl_mem)cmd->p_c;
+            cl_mem d_mem = (cl_mem)cmd->p_d;
+            CHECK_CL_ERR(clSetKernelArg(kernel, 0, sizeof(cl_mem), &v_mem), "Izhikevich Arg 0 (v)");
+            CHECK_CL_ERR(clSetKernelArg(kernel, 1, sizeof(cl_mem), &u_mem), "Izhikevich Arg 1 (u)");
+            CHECK_CL_ERR(clSetKernelArg(kernel, 2, sizeof(cl_mem), &inj_mem), "Izhikevich Arg 2 (i_inj)");
+            CHECK_CL_ERR(clSetKernelArg(kernel, 3, sizeof(cl_mem), &spikes_mem), "Izhikevich Arg 3 (spikes)");
+            CHECK_CL_ERR(clSetKernelArg(kernel, 4, sizeof(cl_mem), &a_mem), "Izhikevich Arg 4 (a)");
+            CHECK_CL_ERR(clSetKernelArg(kernel, 5, sizeof(cl_mem), &b_mem), "Izhikevich Arg 5 (b)");
+            CHECK_CL_ERR(clSetKernelArg(kernel, 6, sizeof(cl_mem), &c_mem), "Izhikevich Arg 6 (c)");
+            CHECK_CL_ERR(clSetKernelArg(kernel, 7, sizeof(cl_mem), &d_mem), "Izhikevich Arg 7 (d)");
+            CHECK_CL_ERR(clSetKernelArg(kernel, 8, sizeof(cl_float), &cmd->dt), "Izhikevich Arg 8 (dt)");
+            CHECK_CL_ERR(clSetKernelArg(kernel, 9, sizeof(cl_float), &cmd->threshold), "Izhikevich Arg 9 (threshold)");
+            CHECK_CL_ERR(clSetKernelArg(kernel, 10, sizeof(cl_int), &cmd->num_neurons), "Izhikevich Arg 10 (N)");
+            size_t gws[1] = { (size_t)cmd->num_neurons };
+            CHECK_CL_ERR(ENQUEUE_KERNEL_PROFILED(kernel, 1, gws, NULL, "izhikevich_neuron_step"), "Izhikevich Enqueue");
+            return 1;
+        }
+        case COMMAND_STDP_UPDATE: {
+            STDPUpdateCommandData* cmd = (STDPUpdateCommandData*)data;
+            if ((!stdp_update_kernel && !stdp_update_kernel_fast) || !cmd || !cmd->weights || !cmd->pre_traces || !cmd->post_traces ||
+                !cmd->pre_spike_events || !cmd->post_spike_events) {
+                fprintf(stderr, "[C] Submit STDP Update: Invalid args or kernel.\n");
+                return 0;
+            }
+            if (cmd->pre_n <= 0 || cmd->post_n <= 0) {
+                if ((cmd->pre_n == 0) || (cmd->post_n == 0)) { return 1; }
+                fprintf(stderr, "[C] Submit STDP Update: Invalid dimensions (pre=%d, post=%d).\n", cmd->pre_n, cmd->post_n);
+                return 0;
+            }
+            cl_kernel kernel = stdp_update_kernel_fast ? stdp_update_kernel_fast : stdp_update_kernel;
+            cl_mem w_mem = (cl_mem)cmd->weights;
+            cl_mem pre_trace_mem = (cl_mem)cmd->pre_traces;
+            cl_mem post_trace_mem = (cl_mem)cmd->post_traces;
+            cl_mem pre_evt_mem = (cl_mem)cmd->pre_spike_events;
+            cl_mem post_evt_mem = (cl_mem)cmd->post_spike_events;
+            CHECK_CL_ERR(clSetKernelArg(kernel, 0, sizeof(cl_mem), &w_mem), "STDP Update Arg 0 (weights)");
+            CHECK_CL_ERR(clSetKernelArg(kernel, 1, sizeof(cl_mem), &pre_trace_mem), "STDP Update Arg 1 (pre_traces)");
+            CHECK_CL_ERR(clSetKernelArg(kernel, 2, sizeof(cl_mem), &post_trace_mem), "STDP Update Arg 2 (post_traces)");
+            CHECK_CL_ERR(clSetKernelArg(kernel, 3, sizeof(cl_mem), &pre_evt_mem), "STDP Update Arg 3 (pre_events)");
+            CHECK_CL_ERR(clSetKernelArg(kernel, 4, sizeof(cl_mem), &post_evt_mem), "STDP Update Arg 4 (post_events)");
+            CHECK_CL_ERR(clSetKernelArg(kernel, 5, sizeof(cl_float), &cmd->lr_ltp), "STDP Update Arg 5 (lr_ltp)");
+            CHECK_CL_ERR(clSetKernelArg(kernel, 6, sizeof(cl_float), &cmd->lr_ltd), "STDP Update Arg 6 (lr_ltd)");
+            CHECK_CL_ERR(clSetKernelArg(kernel, 7, sizeof(cl_int), &cmd->pre_n), "STDP Update Arg 7 (pre_n)");
+            CHECK_CL_ERR(clSetKernelArg(kernel, 8, sizeof(cl_int), &cmd->post_n), "STDP Update Arg 8 (post_n)");
+            size_t total = (size_t)cmd->pre_n * (size_t)cmd->post_n;
+            size_t gws[1] = { total };
+            CHECK_CL_ERR(ENQUEUE_KERNEL_PROFILED(kernel, 1, gws, NULL, "stdp_update_step"), "STDP Update Enqueue");
+            return 1;
+        }
+        case COMMAND_STDP_TRACE_UPDATE: {
+            STDPTraceCommandData* cmd = (STDPTraceCommandData*)data;
+            if ((!stdp_trace_kernel && !stdp_trace_kernel_fast) || !cmd || !cmd->pre_traces || !cmd->post_traces ||
+                !cmd->pre_spike_events || !cmd->post_spike_events) {
+                fprintf(stderr, "[C] Submit STDP Trace: Invalid args or kernel.\n");
+                return 0;
+            }
+            if (cmd->pre_n < 0 || cmd->post_n < 0) {
+                fprintf(stderr, "[C] Submit STDP Trace: Negative dimensions (pre=%d, post=%d).\n", cmd->pre_n, cmd->post_n);
+                return 0;
+            }
+            int max_dim = (cmd->pre_n > cmd->post_n) ? cmd->pre_n : cmd->post_n;
+            if (max_dim <= 0) { return 1; }
+            cl_kernel kernel = stdp_trace_kernel_fast ? stdp_trace_kernel_fast : stdp_trace_kernel;
+            cl_mem pre_trace_mem = (cl_mem)cmd->pre_traces;
+            cl_mem post_trace_mem = (cl_mem)cmd->post_traces;
+            cl_mem pre_evt_mem = (cl_mem)cmd->pre_spike_events;
+            cl_mem post_evt_mem = (cl_mem)cmd->post_spike_events;
+            CHECK_CL_ERR(clSetKernelArg(kernel, 0, sizeof(cl_mem), &pre_trace_mem), "STDP Trace Arg 0 (pre_traces)");
+            CHECK_CL_ERR(clSetKernelArg(kernel, 1, sizeof(cl_mem), &post_trace_mem), "STDP Trace Arg 1 (post_traces)");
+            CHECK_CL_ERR(clSetKernelArg(kernel, 2, sizeof(cl_mem), &pre_evt_mem), "STDP Trace Arg 2 (pre_events)");
+            CHECK_CL_ERR(clSetKernelArg(kernel, 3, sizeof(cl_mem), &post_evt_mem), "STDP Trace Arg 3 (post_events)");
+            CHECK_CL_ERR(clSetKernelArg(kernel, 4, sizeof(cl_float), &cmd->decay_pre), "STDP Trace Arg 4 (decay_pre)");
+            CHECK_CL_ERR(clSetKernelArg(kernel, 5, sizeof(cl_float), &cmd->decay_post), "STDP Trace Arg 5 (decay_post)");
+            CHECK_CL_ERR(clSetKernelArg(kernel, 6, sizeof(cl_float), &cmd->increment_pre), "STDP Trace Arg 6 (inc_pre)");
+            CHECK_CL_ERR(clSetKernelArg(kernel, 7, sizeof(cl_float), &cmd->increment_post), "STDP Trace Arg 7 (inc_post)");
+            CHECK_CL_ERR(clSetKernelArg(kernel, 8, sizeof(cl_int), &cmd->pre_n), "STDP Trace Arg 8 (pre_n)");
+            CHECK_CL_ERR(clSetKernelArg(kernel, 9, sizeof(cl_int), &cmd->post_n), "STDP Trace Arg 9 (post_n)");
+            size_t gws[1] = { (size_t)max_dim };
+            CHECK_CL_ERR(ENQUEUE_KERNEL_PROFILED(kernel, 1, gws, NULL, "stdp_update_traces"), "STDP Trace Enqueue");
+            return 1;
+        }
+        case COMMAND_LBM_COLLIDE_STREAM: {
+            LBMCollideStreamCommandData* cmd = (LBMCollideStreamCommandData*)data;
+            if ((!lbm_kernel && !lbm_kernel_fast) || !cmd || !cmd->f_in || !cmd->f_out || !cmd->rho || !cmd->ux || !cmd->uy) {
+                fprintf(stderr, "[C] Submit LBM: Invalid args or kernel.\n");
+                return 0;
+            }
+            if (cmd->width <= 0 || cmd->height <= 0) {
+                if ((cmd->width == 0) || (cmd->height == 0)) { return 1; }
+                fprintf(stderr, "[C] Submit LBM: Invalid grid dimensions (w=%d, h=%d).\n", cmd->width, cmd->height);
+                return 0;
+            }
+            if (cmd->omega <= 0.0f) {
+                fprintf(stderr, "[C] Submit LBM: Invalid relaxation omega (%f).\n", cmd->omega);
+                return 0;
+            }
+            cl_kernel kernel = lbm_kernel_fast ? lbm_kernel_fast : lbm_kernel;
+            cl_mem fin_mem = (cl_mem)cmd->f_in;
+            cl_mem fout_mem = (cl_mem)cmd->f_out;
+            cl_mem rho_mem = (cl_mem)cmd->rho;
+            cl_mem ux_mem = (cl_mem)cmd->ux;
+            cl_mem uy_mem = (cl_mem)cmd->uy;
+            CHECK_CL_ERR(clSetKernelArg(kernel, 0, sizeof(cl_mem), &fin_mem), "LBM Arg 0 (f_in)");
+            CHECK_CL_ERR(clSetKernelArg(kernel, 1, sizeof(cl_mem), &fout_mem), "LBM Arg 1 (f_out)");
+            CHECK_CL_ERR(clSetKernelArg(kernel, 2, sizeof(cl_mem), &rho_mem), "LBM Arg 2 (rho)");
+            CHECK_CL_ERR(clSetKernelArg(kernel, 3, sizeof(cl_mem), &ux_mem), "LBM Arg 3 (ux)");
+            CHECK_CL_ERR(clSetKernelArg(kernel, 4, sizeof(cl_mem), &uy_mem), "LBM Arg 4 (uy)");
+            CHECK_CL_ERR(clSetKernelArg(kernel, 5, sizeof(cl_float), &cmd->omega), "LBM Arg 5 (omega)");
+            CHECK_CL_ERR(clSetKernelArg(kernel, 6, sizeof(cl_int), &cmd->width), "LBM Arg 6 (width)");
+            CHECK_CL_ERR(clSetKernelArg(kernel, 7, sizeof(cl_int), &cmd->height), "LBM Arg 7 (height)");
+            size_t total = (size_t)cmd->width * (size_t)cmd->height;
+            size_t gws[1] = { total };
+            CHECK_CL_ERR(ENQUEUE_KERNEL_PROFILED(kernel, 1, gws, NULL, "lbm_collide_and_stream"), "LBM Enqueue");
+            return 1;
+        }
+        case COMMAND_NBODY_FORCES: {
+            NBodyForcesCommandData* cmd = (NBodyForcesCommandData*)data;
+            if ((!nbody_forces_kernel && !nbody_forces_kernel_fast) || !cmd || !cmd->positions || !cmd->forces) {
+                fprintf(stderr, "[C] Submit NBody Forces: Invalid args or kernel.\n");
+                return 0;
+            }
+            if (cmd->num_bodies <= 0) {
+                if (cmd->num_bodies == 0) { return 1; }
+                fprintf(stderr, "[C] Submit NBody Forces: Invalid body count (%d).\n", cmd->num_bodies);
+                return 0;
+            }
+            cl_kernel kernel = nbody_forces_kernel_fast ? nbody_forces_kernel_fast : nbody_forces_kernel;
+            cl_mem pos_mem = (cl_mem)cmd->positions;
+            cl_mem force_mem = (cl_mem)cmd->forces;
+            CHECK_CL_ERR(clSetKernelArg(kernel, 0, sizeof(cl_mem), &pos_mem), "NBody Forces Arg 0 (positions)");
+            CHECK_CL_ERR(clSetKernelArg(kernel, 1, sizeof(cl_mem), &force_mem), "NBody Forces Arg 1 (forces)");
+            CHECK_CL_ERR(clSetKernelArg(kernel, 2, sizeof(cl_float), &cmd->gravitational_const), "NBody Forces Arg 2 (G)");
+            CHECK_CL_ERR(clSetKernelArg(kernel, 3, sizeof(cl_float), &cmd->softening_factor), "NBody Forces Arg 3 (softening)");
+            CHECK_CL_ERR(clSetKernelArg(kernel, 4, sizeof(cl_int), &cmd->num_bodies), "NBody Forces Arg 4 (N)");
+            size_t gws[1] = { (size_t)cmd->num_bodies };
+            CHECK_CL_ERR(ENQUEUE_KERNEL_PROFILED(kernel, 1, gws, NULL, "nbody_calculate_forces"), "NBody Forces Enqueue");
+            return 1;
+        }
+        case COMMAND_NBODY_INTEGRATE: {
+            NBodyIntegrateCommandData* cmd = (NBodyIntegrateCommandData*)data;
+            if ((!nbody_integrate_kernel && !nbody_integrate_kernel_fast) || !cmd || !cmd->positions || !cmd->velocities || !cmd->forces) {
+                fprintf(stderr, "[C] Submit NBody Integrate: Invalid args or kernel.\n");
+                return 0;
+            }
+            if (cmd->num_bodies <= 0) {
+                if (cmd->num_bodies == 0) { return 1; }
+                fprintf(stderr, "[C] Submit NBody Integrate: Invalid body count (%d).\n", cmd->num_bodies);
+                return 0;
+            }
+            cl_kernel kernel = nbody_integrate_kernel_fast ? nbody_integrate_kernel_fast : nbody_integrate_kernel;
+            cl_mem pos_mem = (cl_mem)cmd->positions;
+            cl_mem vel_mem = (cl_mem)cmd->velocities;
+            cl_mem force_mem = (cl_mem)cmd->forces;
+            CHECK_CL_ERR(clSetKernelArg(kernel, 0, sizeof(cl_mem), &pos_mem), "NBody Integrate Arg 0 (positions)");
+            CHECK_CL_ERR(clSetKernelArg(kernel, 1, sizeof(cl_mem), &vel_mem), "NBody Integrate Arg 1 (velocities)");
+            CHECK_CL_ERR(clSetKernelArg(kernel, 2, sizeof(cl_mem), &force_mem), "NBody Integrate Arg 2 (forces)");
+            CHECK_CL_ERR(clSetKernelArg(kernel, 3, sizeof(cl_float), &cmd->dt), "NBody Integrate Arg 3 (dt)");
+            CHECK_CL_ERR(clSetKernelArg(kernel, 4, sizeof(cl_int), &cmd->num_bodies), "NBody Integrate Arg 4 (N)");
+            size_t gws[1] = { (size_t)cmd->num_bodies };
+            CHECK_CL_ERR(ENQUEUE_KERNEL_PROFILED(kernel, 1, gws, NULL, "nbody_integrate"), "NBody Integrate Enqueue");
+            return 1;
+        }
+        case COMMAND_ISING_METROPOLIS: {
+            IsingMetropolisCommandData* cmd = (IsingMetropolisCommandData*)data;
+            if ((!ising_kernel && !ising_kernel_fast) || !cmd || !cmd->spin_grid || !cmd->random_numbers) {
+                fprintf(stderr, "[C] Submit Ising: Invalid args or kernel.\n");
+                return 0;
+            }
+            if (cmd->width <= 0 || cmd->height <= 0) {
+                if (cmd->width == 0 || cmd->height == 0) { return 1; }
+                fprintf(stderr, "[C] Submit Ising: Invalid grid dimensions (w=%d, h=%d).\n", cmd->width, cmd->height);
+                return 0;
+            }
+            if ((cmd->color & ~1) != 0) {
+                fprintf(stderr, "[C] Submit Ising: Invalid checkerboard color (%d).\n", cmd->color);
+                return 0;
+            }
+            cl_kernel kernel = ising_kernel_fast ? ising_kernel_fast : ising_kernel;
+            cl_mem spin_mem = (cl_mem)cmd->spin_grid;
+            cl_mem rand_mem = (cl_mem)cmd->random_numbers;
+            CHECK_CL_ERR(clSetKernelArg(kernel, 0, sizeof(cl_mem), &spin_mem), "Ising Arg 0 (spins)");
+            CHECK_CL_ERR(clSetKernelArg(kernel, 1, sizeof(cl_mem), &rand_mem), "Ising Arg 1 (random)");
+            CHECK_CL_ERR(clSetKernelArg(kernel, 2, sizeof(cl_float), &cmd->J), "Ising Arg 2 (J)");
+            CHECK_CL_ERR(clSetKernelArg(kernel, 3, sizeof(cl_float), &cmd->beta), "Ising Arg 3 (beta)");
+            CHECK_CL_ERR(clSetKernelArg(kernel, 4, sizeof(cl_int), &cmd->width), "Ising Arg 4 (width)");
+            CHECK_CL_ERR(clSetKernelArg(kernel, 5, sizeof(cl_int), &cmd->height), "Ising Arg 5 (height)");
+            CHECK_CL_ERR(clSetKernelArg(kernel, 6, sizeof(cl_int), &cmd->color), "Ising Arg 6 (color)");
+            size_t total = (size_t)cmd->width * (size_t)cmd->height;
+            size_t gws[1] = { total };
+            CHECK_CL_ERR(ENQUEUE_KERNEL_PROFILED(kernel, 1, gws, NULL, "ising_metropolis_step"), "Ising Enqueue");
+            return 1;
+        }
         case COMMAND_PROTO_SEGMENTED_SUM: {
             ProtoSegmentedSumCommandData* cmd = (ProtoSegmentedSumCommandData*)data;
             if (!proto_segmented_sum_kernel || !cmd || !cmd->activations_flat || !cmd->indices_flat || !cmd->proto_sums || !cmd->proto_counts) { fprintf(stderr, "[C] Submit Proto Segmented Sum: Error - Invalid arguments or kernel handle missing.\n"); return 0; }
@@ -9534,6 +10116,196 @@ DLLEXPORT int execute_fused_diffusion_on_gpu(
     // Warten Sie auf die Fertigstellung (da die Python-Seite blockierend ist)
     finish_queue_and_check(gpu_index, "execute_fused_diffusion_on_gpu");
 
+    return 1;
+}
+
+DLLEXPORT int execute_izhikevich_step_on_gpu(
+    int gpu_index,
+    void* v,
+    void* u,
+    void* i_inj,
+    void* spikes_out,
+    void* p_a,
+    void* p_b,
+    void* p_c,
+    void* p_d,
+    float dt,
+    float threshold,
+    int num_neurons
+) {
+    if (!v || !u || !i_inj || !spikes_out || !p_a || !p_b || !p_c || !p_d) {
+        fprintf(stderr, "[C] execute_izhikevich_step_on_gpu: Error - NULL buffer handle provided.\n");
+        return 0;
+    }
+    if (num_neurons <= 0) {
+        if (num_neurons == 0) { return 1; }
+        fprintf(stderr, "[C] execute_izhikevich_step_on_gpu: Error - Invalid neuron count (%d).\n", num_neurons);
+        return 0;
+    }
+    if (dt <= 0.0f) {
+        fprintf(stderr, "[C] execute_izhikevich_step_on_gpu: Error - dt must be positive (%.6f).\n", dt);
+        return 0;
+    }
+    IzhikevichCommandData cmd = { v, u, i_inj, spikes_out, p_a, p_b, p_c, p_d, dt, threshold, num_neurons };
+    if (!submit_kernel_command(gpu_index, COMMAND_IZHIKEVICH_STEP, &cmd)) { return 0; }
+    return 1;
+}
+
+DLLEXPORT int execute_stdp_update_on_gpu(
+    int gpu_index,
+    void* weights,
+    void* pre_traces,
+    void* post_traces,
+    void* pre_spike_events,
+    void* post_spike_events,
+    float lr_ltp,
+    float lr_ltd,
+    int pre_n,
+    int post_n
+) {
+    if (!weights || !pre_traces || !post_traces || !pre_spike_events || !post_spike_events) {
+        fprintf(stderr, "[C] execute_stdp_update_on_gpu: Error - NULL buffer handle provided.\n");
+        return 0;
+    }
+    if (pre_n <= 0 || post_n <= 0) {
+        if (pre_n == 0 || post_n == 0) { return 1; }
+        fprintf(stderr, "[C] execute_stdp_update_on_gpu: Error - Invalid dimensions (pre=%d, post=%d).\n", pre_n, post_n);
+        return 0;
+    }
+    if (lr_ltp < 0.0f || lr_ltd < 0.0f) {
+        fprintf(stderr, "[C] execute_stdp_update_on_gpu: Warning - Negative learning rates (ltp=%.6f, ltd=%.6f).\n", lr_ltp, lr_ltd);
+    }
+    STDPUpdateCommandData cmd = { weights, pre_traces, post_traces, pre_spike_events, post_spike_events, lr_ltp, lr_ltd, pre_n, post_n };
+    if (!submit_kernel_command(gpu_index, COMMAND_STDP_UPDATE, &cmd)) { return 0; }
+    return 1;
+}
+
+DLLEXPORT int execute_stdp_trace_update_on_gpu(
+    int gpu_index,
+    void* pre_traces,
+    void* post_traces,
+    void* pre_spike_events,
+    void* post_spike_events,
+    float decay_pre,
+    float decay_post,
+    float increment_pre,
+    float increment_post,
+    int pre_n,
+    int post_n
+) {
+    if (!pre_traces || !post_traces || !pre_spike_events || !post_spike_events) {
+        fprintf(stderr, "[C] execute_stdp_trace_update_on_gpu: Error - NULL buffer handle provided.\n");
+        return 0;
+    }
+    if (pre_n < 0 || post_n < 0) {
+        fprintf(stderr, "[C] execute_stdp_trace_update_on_gpu: Error - Negative dimensions (pre=%d, post=%d).\n", pre_n, post_n);
+        return 0;
+    }
+    int max_dim = (pre_n > post_n) ? pre_n : post_n;
+    if (max_dim == 0) { return 1; }
+    STDPTraceCommandData cmd = { pre_traces, post_traces, pre_spike_events, post_spike_events, decay_pre, decay_post, increment_pre, increment_post, pre_n, post_n };
+    if (!submit_kernel_command(gpu_index, COMMAND_STDP_TRACE_UPDATE, &cmd)) { return 0; }
+    return 1;
+}
+
+DLLEXPORT int execute_lbm_collide_and_stream_on_gpu(
+    int gpu_index,
+    void* f_in,
+    void* f_out,
+    void* rho,
+    void* ux,
+    void* uy,
+    float omega,
+    int width,
+    int height
+) {
+    if (!f_in || !f_out || !rho || !ux || !uy) {
+        fprintf(stderr, "[C] execute_lbm_collide_and_stream_on_gpu: Error - NULL buffer handle provided.\n");
+        return 0;
+    }
+    if (width <= 0 || height <= 0) {
+        if (width == 0 || height == 0) { return 1; }
+        fprintf(stderr, "[C] execute_lbm_collide_and_stream_on_gpu: Error - Invalid grid size (w=%d, h=%d).\n", width, height);
+        return 0;
+    }
+    if (omega <= 0.0f) {
+        fprintf(stderr, "[C] execute_lbm_collide_and_stream_on_gpu: Error - omega must be positive (%.6f).\n", omega);
+        return 0;
+    }
+    LBMCollideStreamCommandData cmd = { f_in, f_out, rho, ux, uy, omega, width, height };
+    if (!submit_kernel_command(gpu_index, COMMAND_LBM_COLLIDE_STREAM, &cmd)) { return 0; }
+    return 1;
+}
+
+DLLEXPORT int execute_nbody_calculate_forces_on_gpu(
+    int gpu_index,
+    void* positions,
+    void* forces,
+    float gravitational_const,
+    float softening_factor,
+    int num_bodies
+) {
+    if (!positions || !forces) {
+        fprintf(stderr, "[C] execute_nbody_calculate_forces_on_gpu: Error - NULL buffer handle provided.\n");
+        return 0;
+    }
+    if (num_bodies <= 0) {
+        if (num_bodies == 0) { return 1; }
+        fprintf(stderr, "[C] execute_nbody_calculate_forces_on_gpu: Error - Invalid body count (%d).\n", num_bodies);
+        return 0;
+    }
+    NBodyForcesCommandData cmd = { positions, forces, gravitational_const, softening_factor, num_bodies };
+    if (!submit_kernel_command(gpu_index, COMMAND_NBODY_FORCES, &cmd)) { return 0; }
+    return 1;
+}
+
+DLLEXPORT int execute_nbody_integrate_on_gpu(
+    int gpu_index,
+    void* positions,
+    void* velocities,
+    void* forces,
+    float dt,
+    int num_bodies
+) {
+    if (!positions || !velocities || !forces) {
+        fprintf(stderr, "[C] execute_nbody_integrate_on_gpu: Error - NULL buffer handle provided.\n");
+        return 0;
+    }
+    if (num_bodies <= 0) {
+        if (num_bodies == 0) { return 1; }
+        fprintf(stderr, "[C] execute_nbody_integrate_on_gpu: Error - Invalid body count (%d).\n", num_bodies);
+        return 0;
+    }
+    NBodyIntegrateCommandData cmd = { positions, velocities, forces, dt, num_bodies };
+    if (!submit_kernel_command(gpu_index, COMMAND_NBODY_INTEGRATE, &cmd)) { return 0; }
+    return 1;
+}
+
+DLLEXPORT int execute_ising_metropolis_step_on_gpu(
+    int gpu_index,
+    void* spin_grid,
+    void* random_numbers,
+    float J,
+    float beta,
+    int width,
+    int height,
+    int color
+) {
+    if (!spin_grid || !random_numbers) {
+        fprintf(stderr, "[C] execute_ising_metropolis_step_on_gpu: Error - NULL buffer handle provided.\n");
+        return 0;
+    }
+    if (width <= 0 || height <= 0) {
+        if (width == 0 || height == 0) { return 1; }
+        fprintf(stderr, "[C] execute_ising_metropolis_step_on_gpu: Error - Invalid grid size (w=%d, h=%d).\n", width, height);
+        return 0;
+    }
+    if ((color & ~1) != 0) {
+        fprintf(stderr, "[C] execute_ising_metropolis_step_on_gpu: Error - color must be 0 or 1 (got %d).\n", color);
+        return 0;
+    }
+    IsingMetropolisCommandData cmd = { spin_grid, random_numbers, J, beta, width, height, color };
+    if (!submit_kernel_command(gpu_index, COMMAND_ISING_METROPOLIS, &cmd)) { return 0; }
     return 1;
 }
 
