@@ -25,6 +25,7 @@
 #include <math.h>
 #include <float.h> /* For FLT_MAX, HUGE_VALF */
 #include <stdint.h> // For uintptr_t
+#include <stdarg.h>
 #include <stdbool.h>
 #include <limits.h>
 #include <ctype.h>
@@ -152,6 +153,43 @@ unsigned int read_pci_config(int gpu_index, int offset) { return 0; }
 // --- Global Data Type ---
 /** @brief Defines the primary floating-point type used on the host side. */
 #define FP_TYPE KERNEL_FP_TYPE
+
+#ifndef CC_DRIVER_VERSION
+#define CC_DRIVER_VERSION "1.0.0"
+#endif
+
+#if defined(_MSC_VER)
+#define CC_THREAD_LOCAL __declspec(thread)
+#elif defined(__STDC_VERSION__) && __STDC_VERSION__ >= 201112L
+#define CC_THREAD_LOCAL _Thread_local
+#else
+#define CC_THREAD_LOCAL __thread
+#endif
+
+#define CC_ERROR_BUFFER_BYTES 512
+
+static CC_THREAD_LOCAL char g_last_error_message[CC_ERROR_BUFFER_BYTES] = "OK";
+static CC_THREAD_LOCAL cl_command_queue g_thread_queue = NULL;
+static CC_THREAD_LOCAL int g_thread_gpu_index = -1;
+
+static void cc_set_last_error(const char* fmt, ...) {
+    if (!fmt) {
+        strncpy(g_last_error_message, "Unknown error", CC_ERROR_BUFFER_BYTES - 1);
+        g_last_error_message[CC_ERROR_BUFFER_BYTES - 1] = '\0';
+        return;
+    }
+    va_list args;
+    va_start(args, fmt);
+    vsnprintf(g_last_error_message, CC_ERROR_BUFFER_BYTES, fmt, args);
+    va_end(args);
+    g_last_error_message[CC_ERROR_BUFFER_BYTES - 1] = '\0';
+}
+
+static inline void cc_clear_last_error(void) {
+    strncpy(g_last_error_message, "OK", CC_ERROR_BUFFER_BYTES - 1);
+    g_last_error_message[CC_ERROR_BUFFER_BYTES - 1] = '\0';
+}
+
 
 // --- OpenCL Globals ---
 /** @brief Handle to the OpenCL context. */
@@ -318,6 +356,7 @@ static GpuSlot* cc_get_slot(int gpu_index);
 static void cc_mark_slot_initialized(int gpu_index, cl_context ctx, cl_command_queue q, cl_program program);
 static void cc_reset_slot(GpuSlot* slot);
 static void cc_release_all_slots(void);
+static cl_command_queue cc_get_slot_queue(int gpu_index, int prefer_transfer, GpuSlot** out_slot);
 cl_program matmul_batched_backward_da_program = NULL; cl_kernel matmul_batched_backward_da_kernel = NULL;
 cl_program matmul_batched_backward_da_program_fast = NULL;
 cl_kernel matmul_batched_backward_da_kernel_fast = NULL;
@@ -1202,6 +1241,8 @@ static cl_int enqueue_kernel_with_metrics(cl_kernel kernel,
                                           const char* kernel_name,
                                           float* error_out,
                                           float* variance_out);
+DLLEXPORT const char* cc_get_last_error(void);
+DLLEXPORT const char* cc_get_version(void);
 
 #define ENQUEUE_KERNEL_PROFILED(kernel_handle, work_dim, global_ptr, local_ptr, kernel_label) \
     enqueue_kernel_with_metrics(kernel_handle, work_dim, global_ptr, local_ptr, kernel_label, NULL, NULL)
@@ -4772,10 +4813,20 @@ DLLEXPORT int initialize_gpu(int gpu_index) {
  */
 DLLEXPORT void *allocate_gpu_memory(int gpu_index, size_t size) {
     cl_int err;
-    if (!context) { fprintf(stderr, "[C] allocate_gpu_memory: Error - No OpenCL context available.\n"); return NULL; }
-    if (size == 0) { fprintf(stderr, "[C] allocate_gpu_memory: Warning - Attempted to allocate 0 bytes. Returning NULL.\n"); return NULL; }
+    if (!context) {
+        cc_set_last_error("[C] allocate_gpu_memory: Error - No OpenCL context available");
+        fprintf(stderr, "[C] allocate_gpu_memory: Error - No OpenCL context available.\n");
+        return NULL;
+    }
+    if (size == 0) {
+        cc_set_last_error("[C] allocate_gpu_memory: Warning - Attempted to allocate 0 bytes");
+        fprintf(stderr, "[C] allocate_gpu_memory: Warning - Attempted to allocate 0 bytes. Returning NULL.\n");
+        return NULL;
+    }
     cl_mem buffer = clCreateBuffer(context, CL_MEM_READ_WRITE, size, NULL, &err);
     if (!buffer || err != CL_SUCCESS) {
+        cc_set_last_error("[C] allocate_gpu_memory: Error - clCreateBuffer failed: %s (%d) for size %zu bytes",
+                          clGetErrorString(err), err, size);
         fprintf(stderr, "[C] allocate_gpu_memory: Error - clCreateBuffer failed: %s (%d) for size %zu bytes.\n", clGetErrorString(err), err, size);
         return NULL;
     }
@@ -4799,13 +4850,35 @@ DLLEXPORT void free_gpu_memory(int gpu_index, void* buffer_handle) {
  * @brief Writes data from host memory to a GPU buffer (blocking).
  */
 DLLEXPORT int write_host_to_gpu_blocking(int gpu_index, void* gpu_buffer_handle, size_t offset, size_t size, const void* host_source_ptr) {
-     if (!gpu_buffer_handle) { fprintf(stderr, "[C] write_host_to_gpu_blocking: Error - Invalid GPU buffer handle (NULL).\n"); return 0; }
-    if (size > 0 && !host_source_ptr) { fprintf(stderr, "[C] write_host_to_gpu_blocking: Error - Host source pointer is NULL but size > 0 (%zu).\n", size); return 0; }
-    if (!queue) { fprintf(stderr, "[C] write_host_to_gpu_blocking: Error - Command queue is NULL.\n"); return 0; }
+    if (!gpu_buffer_handle) {
+        cc_set_last_error("[C] write_host_to_gpu_blocking: Error - Invalid GPU buffer handle (NULL)");
+        fprintf(stderr, "[C] write_host_to_gpu_blocking: Error - Invalid GPU buffer handle (NULL).\n");
+        return 0;
+    }
+    if (size > 0 && !host_source_ptr) {
+        cc_set_last_error("[C] write_host_to_gpu_blocking: Error - Host source pointer is NULL but size > 0 (%zu)", size);
+        fprintf(stderr, "[C] write_host_to_gpu_blocking: Error - Host source pointer is NULL but size > 0 (%zu).\n", size);
+        return 0;
+    }
+    GpuSlot* slot = NULL;
+    cl_command_queue active_queue = cc_get_slot_queue(gpu_index, 1, &slot);
+    if (!active_queue) {
+        cc_set_last_error("[C] write_host_to_gpu_blocking: Error - Command queue is NULL");
+        fprintf(stderr, "[C] write_host_to_gpu_blocking: Error - Command queue is NULL.\n");
+        return 0;
+    }
+    g_thread_queue = active_queue;
+    g_thread_gpu_index = gpu_index;
     if (size == 0) { return 1; }
     cl_mem gpu_buffer = (cl_mem)gpu_buffer_handle;
-    cl_int err = clEnqueueWriteBuffer(queue, gpu_buffer, CL_TRUE, offset, size, host_source_ptr, 0, NULL, NULL);
-    if (err != CL_SUCCESS) { fprintf(stderr, "[C] write_host_to_gpu_blocking: Error - clEnqueueWriteBuffer failed: %s (%d) [offset=%zu, size=%zu]\n", clGetErrorString(err), err, offset, size); return 0; }
+    cl_int err = clEnqueueWriteBuffer(active_queue, gpu_buffer, CL_TRUE, offset, size, host_source_ptr, 0, NULL, NULL);
+    if (err != CL_SUCCESS) {
+        cc_set_last_error("[C] write_host_to_gpu_blocking: Error - clEnqueueWriteBuffer failed: %s (%d) [offset=%zu, size=%zu]",
+                          clGetErrorString(err), err, offset, size);
+        fprintf(stderr, "[C] write_host_to_gpu_blocking: Error - clEnqueueWriteBuffer failed: %s (%d) [offset=%zu, size=%zu]\n",
+                clGetErrorString(err), err, offset, size);
+        return 0;
+    }
     return 1;
 }
 
@@ -4813,13 +4886,35 @@ DLLEXPORT int write_host_to_gpu_blocking(int gpu_index, void* gpu_buffer_handle,
  * @brief Reads data from a GPU buffer to host memory (blocking).
  */
 DLLEXPORT int read_gpu_to_host_blocking(int gpu_index, void* gpu_buffer_handle, size_t offset, size_t size, void* host_destination_ptr) {
-     if (!gpu_buffer_handle) { fprintf(stderr, "[C] read_gpu_to_host_blocking: Error - Invalid GPU buffer handle (NULL).\n"); return 0; }
-     if (size > 0 && !host_destination_ptr) { fprintf(stderr, "[C] read_gpu_to_host_blocking: Error - Host destination pointer is NULL but size > 0 (%zu).\n", size); return 0; }
-     if (!queue) { fprintf(stderr, "[C] read_gpu_to_host_blocking: Error - Command queue is NULL.\n"); return 0; }
-     if (size == 0) { return 1; }
+    if (!gpu_buffer_handle) {
+        cc_set_last_error("[C] read_gpu_to_host_blocking: Error - Invalid GPU buffer handle (NULL)");
+        fprintf(stderr, "[C] read_gpu_to_host_blocking: Error - Invalid GPU buffer handle (NULL).\n");
+        return 0;
+    }
+    if (size > 0 && !host_destination_ptr) {
+        cc_set_last_error("[C] read_gpu_to_host_blocking: Error - Host destination pointer is NULL but size > 0 (%zu)", size);
+        fprintf(stderr, "[C] read_gpu_to_host_blocking: Error - Host destination pointer is NULL but size > 0 (%zu).\n", size);
+        return 0;
+    }
+    GpuSlot* slot = NULL;
+    cl_command_queue active_queue = cc_get_slot_queue(gpu_index, 1, &slot);
+    if (!active_queue) {
+        cc_set_last_error("[C] read_gpu_to_host_blocking: Error - Command queue is NULL");
+        fprintf(stderr, "[C] read_gpu_to_host_blocking: Error - Command queue is NULL.\n");
+        return 0;
+    }
+    g_thread_queue = active_queue;
+    g_thread_gpu_index = gpu_index;
+    if (size == 0) { return 1; }
     cl_mem gpu_buffer = (cl_mem)gpu_buffer_handle;
-    cl_int err = clEnqueueReadBuffer(queue, gpu_buffer, CL_TRUE, offset, size, host_destination_ptr, 0, NULL, NULL);
-    if (err != CL_SUCCESS) { fprintf(stderr, "[C] read_gpu_to_host_blocking: Error - clEnqueueReadBuffer failed: %s (%d) [offset=%zu, size=%zu]\n", clGetErrorString(err), err, offset, size); return 0; }
+    cl_int err = clEnqueueReadBuffer(active_queue, gpu_buffer, CL_TRUE, offset, size, host_destination_ptr, 0, NULL, NULL);
+    if (err != CL_SUCCESS) {
+        cc_set_last_error("[C] read_gpu_to_host_blocking: Error - clEnqueueReadBuffer failed: %s (%d) [offset=%zu, size=%zu]",
+                          clGetErrorString(err), err, offset, size);
+        fprintf(stderr, "[C] read_gpu_to_host_blocking: Error - clEnqueueReadBuffer failed: %s (%d) [offset=%zu, size=%zu]\n",
+                clGetErrorString(err), err, offset, size);
+        return 0;
+    }
     return 1;
 }
 
@@ -7705,22 +7800,26 @@ static cl_int enqueue_kernel_with_metrics(cl_kernel kernel,
                                           const char* kernel_name,
                                           float* error_out,
                                           float* variance_out) {
-    if (!queue) {
+    cl_command_queue active_queue = g_thread_queue ? g_thread_queue : queue;
+    if (!active_queue) {
+        cc_set_last_error("[C] enqueue_kernel_with_metrics: No active command queue available");
         return CL_INVALID_COMMAND_QUEUE;
     }
     cl_event evt = NULL;
-    cl_int err = clEnqueueNDRangeKernel(queue, kernel, work_dim, NULL,
+    cl_int err = clEnqueueNDRangeKernel(active_queue, kernel, work_dim, NULL,
                                         global_work_size, local_work_size,
                                         0, NULL, &evt);
     if (err != CL_SUCCESS) {
         fprintf(stderr, "[C] enqueue_kernel_with_metrics: Failed to launch %s: %s (%d)\n",
                 kernel_name ? kernel_name : "<unknown>", clGetErrorString(err), err);
+        cc_set_last_error("[C] enqueue_kernel_with_metrics: Failed to launch %s: %s (%d)",
+                          kernel_name ? kernel_name : "<unknown>", clGetErrorString(err), err);
         return err;
     }
     if (evt) {
         clWaitForEvents(1, &evt);
     } else {
-        clFinish(queue);
+        clFinish(active_queue);
     }
 
     cl_ulong start_time = 0;
@@ -9021,11 +9120,22 @@ static int solve_linear_system(const float* matrix, const float* vector, int n, 
  */
 int submit_kernel_command(int gpu_index, GPUCommand command, void *data) {
     cl_int err = CL_SUCCESS;
-    if (!queue) { fprintf(stderr, "[C] submit_kernel_command: Error - Invalid command queue (NULL).\n"); return 0; }
+    GpuSlot* slot = NULL;
+    cc_clear_last_error();
+    cl_command_queue active_queue = cc_get_slot_queue(gpu_index, 0, &slot);
+    if (!active_queue) {
+        cc_set_last_error("[C] submit_kernel_command: Error - Invalid command queue (NULL)");
+        fprintf(stderr, "[C] submit_kernel_command: Error - Invalid command queue (NULL).\n");
+        return 0;
+    }
+    g_thread_queue = active_queue;
+    g_thread_gpu_index = gpu_index;
 
     #define CHECK_CL_ERR(call, kernel_name_str) \
         err = (call); \
         if (err != CL_SUCCESS) { \
+            cc_set_last_error("[C] OpenCL Error (%s): %s (%d) during '%s'", \
+                              kernel_name_str, clGetErrorString(err), err, #call); \
             fprintf(stderr, "[C] OpenCL Error (%s): %s (%d) during '%s' in %s line %d\n", \
                     kernel_name_str, clGetErrorString(err), err, #call, __FILE__, __LINE__); \
             return 0; \
@@ -9134,7 +9244,7 @@ int submit_kernel_command(int gpu_index, GPUCommand command, void *data) {
             if (cmd->size == 0) return 1;
             cl_mem src = (cl_mem)cmd->src_buffer;
             cl_mem dst = (cl_mem)cmd->dst_buffer;
-            CHECK_CL_ERR(clEnqueueCopyBuffer(queue, src, dst, 0, 0, cmd->size, 0, NULL, NULL), "Clone Enqueue (CopyBuffer)");
+            CHECK_CL_ERR(clEnqueueCopyBuffer(active_queue, src, dst, 0, 0, cmd->size, 0, NULL, NULL), "Clone Enqueue (CopyBuffer)");
             return 1;
         }
         case COMMAND_TRANSPOSE: {
@@ -10116,11 +10226,14 @@ int finish_queue_and_check(int gpu_index, const char* func_name) {
         active_queue = slot->queue;
     }
     if (!active_queue) {
+        cc_set_last_error("[C] %s: Error - Command queue is NULL. Cannot finish.", func_name ? func_name : "finish_queue_and_check");
         fprintf(stderr, "[C] %s: Error - Command queue is NULL. Cannot finish.\n", func_name ? func_name : "finish_queue_and_check");
         return 0;
     }
     cl_int err = clFinish(active_queue);
     if (err != CL_SUCCESS) {
+        cc_set_last_error("[C] %s: Error during clFinish after submitting commands: %s (%d)",
+                          func_name ? func_name : "finish_queue_and_check", clGetErrorString(err), err);
         fprintf(stderr, "[C] %s: Error during clFinish after submitting commands: %s (%d)\n", func_name ? func_name : "finish_queue_and_check", clGetErrorString(err), err);
         return 0;
     }
@@ -10131,12 +10244,34 @@ DLLEXPORT int finish_gpu(int gpu_index) {
     return finish_queue_and_check(gpu_index, "finish_gpu");
 }
 
+DLLEXPORT const char* cc_get_last_error(void) {
+    return g_last_error_message[0] ? g_last_error_message : "OK";
+}
+
+DLLEXPORT const char* cc_get_version(void) {
+    return CC_DRIVER_VERSION;
+}
+
 // --- Exported Function Definitions (Wrappers for Kernel Execution) ---
 
 DLLEXPORT int execute_matmul_on_gpu(int gpu_index, void* buffer_a, void* buffer_b, void* buffer_c, int B, int M, int N, int K) {
-    if (!buffer_a || !buffer_b || !buffer_c) { fprintf(stderr, "[C] execute_matmul_on_gpu: Error - NULL buffer handle provided.\n"); return 0; }
-    if (B <= 0 || M <= 0 || N <= 0) { if ((size_t)B * M * N == 0) return 1; fprintf(stderr, "[C] execute_matmul_on_gpu: Error - Invalid non-positive dimensions (B=%d, M=%d, N=%d).\n", B, M, N); return 0; }
-    if (K <= 0) { fprintf(stderr, "[C] execute_matmul_on_gpu: Error - Invalid non-positive dimension K=%d.\n", K); return 0; }
+    cc_clear_last_error();
+    if (!buffer_a || !buffer_b || !buffer_c) {
+        cc_set_last_error("[C] execute_matmul_on_gpu: Error - NULL buffer handle provided");
+        fprintf(stderr, "[C] execute_matmul_on_gpu: Error - NULL buffer handle provided.\n");
+        return 0;
+    }
+    if (B <= 0 || M <= 0 || N <= 0) {
+        if ((size_t)B * M * N == 0) { return 1; }
+        cc_set_last_error("[C] execute_matmul_on_gpu: Error - Invalid non-positive dimensions (B=%d, M=%d, N=%d)", B, M, N);
+        fprintf(stderr, "[C] execute_matmul_on_gpu: Error - Invalid non-positive dimensions (B=%d, M=%d, N=%d).\n", B, M, N);
+        return 0;
+    }
+    if (K <= 0) {
+        cc_set_last_error("[C] execute_matmul_on_gpu: Error - Invalid non-positive dimension K=%d", K);
+        fprintf(stderr, "[C] execute_matmul_on_gpu: Error - Invalid non-positive dimension K=%d.\n", K);
+        return 0;
+    }
     BMMCommandData cmd_data = { buffer_a, buffer_b, buffer_c, B, M, N, K };
     if (!submit_kernel_command(gpu_index, COMMAND_MATRIX_MULTIPLY, &cmd_data)) { return 0; }
     return 1;
@@ -10177,6 +10312,22 @@ DLLEXPORT int execute_mul_on_gpu(int gpu_index, void* buffer_a, void* buffer_b, 
     return 1;
 }
 
+static cl_command_queue cc_get_slot_queue(int gpu_index, int prefer_transfer, GpuSlot** out_slot) {
+    if (out_slot) { *out_slot = NULL; }
+    GpuSlot* slot = cc_get_slot(gpu_index);
+    if (out_slot) { *out_slot = slot; }
+    if (!slot) {
+        return queue;
+    }
+    if (prefer_transfer && slot->transfer_queue) {
+        return slot->transfer_queue;
+    }
+    if (slot->queue) {
+        return slot->queue;
+    }
+    return queue;
+}
+
 DLLEXPORT int execute_conv2d_forward_on_gpu(
     int gpu_index,
     void* input,
@@ -10193,12 +10344,16 @@ DLLEXPORT int execute_conv2d_forward_on_gpu(
     int stride_h,
     int stride_w
 ) {
+    cc_clear_last_error();
     if (!input || !weights || !output) {
+        cc_set_last_error("[C] execute_conv2d_forward_on_gpu: Error - NULL buffer handle provided");
         fprintf(stderr, "[C] execute_conv2d_forward_on_gpu: Error - NULL buffer handle provided.\n");
         return 0;
     }
     if (B <= 0 || C_in <= 0 || H <= 0 || W <= 0 || C_out <= 0 || K_h <= 0 || K_w <= 0 || stride_h <= 0 || stride_w <= 0) {
         if ((size_t)B * C_out == 0) { return 1; }
+        cc_set_last_error("[C] execute_conv2d_forward_on_gpu: Error - Invalid dimensions (B=%d, Cin=%d, H=%d, W=%d, Cout=%d, Kh=%d, Kw=%d, Sh=%d, Sw=%d)",
+                          B, C_in, H, W, C_out, K_h, K_w, stride_h, stride_w);
         fprintf(stderr, "[C] execute_conv2d_forward_on_gpu: Error - Invalid dimensions (B=%d, Cin=%d, H=%d, W=%d, Cout=%d, Kh=%d, Kw=%d, Sh=%d, Sw=%d).\n",
                 B, C_in, H, W, C_out, K_h, K_w, stride_h, stride_w);
         return 0;
@@ -10206,6 +10361,7 @@ DLLEXPORT int execute_conv2d_forward_on_gpu(
     int out_h = (H - K_h) / stride_h + 1;
     int out_w = (W - K_w) / stride_w + 1;
     if (out_h <= 0 || out_w <= 0) {
+        cc_set_last_error("[C] execute_conv2d_forward_on_gpu: Error - Output dimensions non-positive (out_h=%d, out_w=%d)", out_h, out_w);
         fprintf(stderr, "[C] execute_conv2d_forward_on_gpu: Error - Output dimensions non-positive (out_h=%d, out_w=%d).\n", out_h, out_w);
         return 0;
     }
@@ -10232,13 +10388,17 @@ DLLEXPORT int execute_conv2d_backward_on_gpu(
     int stride_h,
     int stride_w
 ) {
+    cc_clear_last_error();
     if (!grad_output || !input || !weights) {
+        cc_set_last_error("[C] execute_conv2d_backward_on_gpu: Error - NULL required buffer provided");
         fprintf(stderr, "[C] execute_conv2d_backward_on_gpu: Error - NULL required buffer provided.\n");
         return 0;
     }
     if (!grad_input && !grad_weights && !grad_bias) { return 1; }
     if (B <= 0 || C_in <= 0 || H <= 0 || W <= 0 || C_out <= 0 || K_h <= 0 || K_w <= 0 || stride_h <= 0 || stride_w <= 0) {
         if ((size_t)B * C_out == 0) { return 1; }
+        cc_set_last_error("[C] execute_conv2d_backward_on_gpu: Error - Invalid dimensions (B=%d, Cin=%d, H=%d, W=%d, Cout=%d, Kh=%d, Kw=%d, Sh=%d, Sw=%d)",
+                          B, C_in, H, W, C_out, K_h, K_w, stride_h, stride_w);
         fprintf(stderr, "[C] execute_conv2d_backward_on_gpu: Error - Invalid dimensions (B=%d, Cin=%d, H=%d, W=%d, Cout=%d, Kh=%d, Kw=%d, Sh=%d, Sw=%d).\n",
                 B, C_in, H, W, C_out, K_h, K_w, stride_h, stride_w);
         return 0;
@@ -10246,6 +10406,7 @@ DLLEXPORT int execute_conv2d_backward_on_gpu(
     int out_h = (H - K_h) / stride_h + 1;
     int out_w = (W - K_w) / stride_w + 1;
     if (out_h <= 0 || out_w <= 0) {
+        cc_set_last_error("[C] execute_conv2d_backward_on_gpu: Error - Output dimensions non-positive (out_h=%d, out_w=%d)", out_h, out_w);
         fprintf(stderr, "[C] execute_conv2d_backward_on_gpu: Error - Output dimensions non-positive (out_h=%d, out_w=%d).\n", out_h, out_w);
         return 0;
     }
@@ -10256,12 +10417,15 @@ DLLEXPORT int execute_conv2d_backward_on_gpu(
 }
 
 DLLEXPORT int execute_patch_permute_reshape_on_gpu(int gpu_index, void* input, void* output, int B, int C, int H, int W) {
+    cc_clear_last_error();
     if (!input || !output) {
+        cc_set_last_error("[C] execute_patch_permute_reshape_on_gpu: Error - NULL buffer handle provided");
         fprintf(stderr, "[C] execute_patch_permute_reshape_on_gpu: Error - NULL buffer handle provided.\n");
         return 0;
     }
     if (B <= 0 || C <= 0 || H <= 0 || W <= 0) {
         if ((size_t)B * C * H * W == 0) { return 1; }
+        cc_set_last_error("[C] execute_patch_permute_reshape_on_gpu: Error - Invalid dimensions (B=%d, C=%d, H=%d, W=%d)", B, C, H, W);
         fprintf(stderr, "[C] execute_patch_permute_reshape_on_gpu: Error - Invalid dimensions (B=%d, C=%d, H=%d, W=%d).\n", B, C, H, W);
         return 0;
     }
@@ -10271,12 +10435,15 @@ DLLEXPORT int execute_patch_permute_reshape_on_gpu(int gpu_index, void* input, v
 }
 
 DLLEXPORT int execute_patch_permute_reshape_backward_on_gpu(int gpu_index, void* grad_tokens, void* grad_feature, int B, int C, int H, int W) {
+    cc_clear_last_error();
     if (!grad_tokens || !grad_feature) {
+        cc_set_last_error("[C] execute_patch_permute_reshape_backward_on_gpu: Error - NULL buffer handle provided");
         fprintf(stderr, "[C] execute_patch_permute_reshape_backward_on_gpu: Error - NULL buffer handle provided.\n");
         return 0;
     }
     if (B <= 0 || C <= 0 || H <= 0 || W <= 0) {
         if ((size_t)B * C * H * W == 0) { return 1; }
+        cc_set_last_error("[C] execute_patch_permute_reshape_backward_on_gpu: Error - Invalid dimensions (B=%d, C=%d, H=%d, W=%d)", B, C, H, W);
         fprintf(stderr, "[C] execute_patch_permute_reshape_backward_on_gpu: Error - Invalid dimensions (B=%d, C=%d, H=%d, W=%d).\n", B, C, H, W);
         return 0;
     }
@@ -10286,7 +10453,9 @@ DLLEXPORT int execute_patch_permute_reshape_backward_on_gpu(int gpu_index, void*
 }
 
 DLLEXPORT int execute_eon_encoder_chain_on_gpu(int gpu_index, void* buffer_input, void* buffer_output, size_t num_bytes) {
+    cc_clear_last_error();
     if (!buffer_input || !buffer_output) {
+        cc_set_last_error("[C] execute_eon_encoder_chain_on_gpu: Error - NULL buffer handle provided");
         fprintf(stderr, "[C] execute_eon_encoder_chain_on_gpu: Error - NULL buffer handle provided.\n");
         return 0;
     }
@@ -10297,7 +10466,9 @@ DLLEXPORT int execute_eon_encoder_chain_on_gpu(int gpu_index, void* buffer_input
 }
 
 DLLEXPORT int execute_eon_encoder_backward_chain_on_gpu(int gpu_index, void* buffer_grad_output, void* buffer_grad_input, size_t num_bytes) {
+    cc_clear_last_error();
     if (!buffer_grad_output || !buffer_grad_input) {
+        cc_set_last_error("[C] execute_eon_encoder_backward_chain_on_gpu: Error - NULL buffer handle provided");
         fprintf(stderr, "[C] execute_eon_encoder_backward_chain_on_gpu: Error - NULL buffer handle provided.\n");
         return 0;
     }
@@ -10320,15 +10491,19 @@ DLLEXPORT int compute_ctc_loss_cpu(
     float* loss_out,
     float* grad_out
 ) {
+    cc_clear_last_error();
     if (!logits || !targets || !target_lengths || !input_lengths || !loss_out) {
+        cc_set_last_error("[C] compute_ctc_loss_cpu: Error - NULL required pointer provided");
         fprintf(stderr, "[C] compute_ctc_loss_cpu: Error - NULL required pointer provided.\n");
         return 0;
     }
     if (T <= 0 || B <= 0 || V <= 0 || max_target_len < 0) {
+        cc_set_last_error("[C] compute_ctc_loss_cpu: Error - Invalid dimensions (T=%d, B=%d, V=%d, max_target_len=%d)", T, B, V, max_target_len);
         fprintf(stderr, "[C] compute_ctc_loss_cpu: Error - Invalid dimensions (T=%d, B=%d, V=%d, max_target_len=%d).\n", T, B, V, max_target_len);
         return 0;
     }
     if (blank_index < 0 || blank_index >= V) {
+        cc_set_last_error("[C] compute_ctc_loss_cpu: Error - Invalid blank index %d for vocab size %d", blank_index, V);
         fprintf(stderr, "[C] compute_ctc_loss_cpu: Error - Invalid blank index %d for vocab size %d.\n", blank_index, V);
         return 0;
     }
@@ -10338,6 +10513,7 @@ DLLEXPORT int compute_ctc_loss_cpu(
     float* log_probs = (float*)malloc(total_elements * sizeof(float));
     float* probs = (float*)malloc(total_elements * sizeof(float));
     if (!log_probs || !probs) {
+        cc_set_last_error("[C] compute_ctc_loss_cpu: Error - Failed to allocate intermediate buffers");
         fprintf(stderr, "[C] compute_ctc_loss_cpu: Error - Failed to allocate intermediate buffers.\n");
         free(log_probs);
         free(probs);
@@ -10394,6 +10570,7 @@ DLLEXPORT int compute_ctc_loss_cpu(
         float* alpha = (float*)malloc((size_t)T_b * S * sizeof(float));
         float* beta = (float*)malloc((size_t)T_b * S * sizeof(float));
         if (!ext || !alpha || !beta) {
+            cc_set_last_error("[C] compute_ctc_loss_cpu: Error - Failed to allocate DP buffers");
             fprintf(stderr, "[C] compute_ctc_loss_cpu: Error - Failed to allocate DP buffers.\n");
             free(ext); free(alpha); free(beta);
             free(log_probs); free(probs);
@@ -10571,15 +10748,26 @@ DLLEXPORT int execute_layernorm_backward_on_gpu(int gpu_index, void* buffer_dy, 
     return 1;
 }
 DLLEXPORT int execute_adam_update_on_gpu(int gpu_index, void* param_buffer, void* grad_buffer, void* m_buffer, void* v_buffer, int num_elements, int t, float lr, float beta1, float beta2, float eps, float weight_decay) {
-    float beta1_t, beta2_t;
-    if (!param_buffer || !grad_buffer || !m_buffer || !v_buffer) { fprintf(stderr, "[C] execute_adam_update_on_gpu: Error - NULL buffer handle provided.\n"); return 0; }
-    if (num_elements <= 0) { if (num_elements == 0) return 1; fprintf(stderr, "[C] execute_adam_update_on_gpu: Error - Invalid non-positive number of elements (%d).\n", num_elements); return 0; }
+    cc_clear_last_error();
+    if (!param_buffer || !grad_buffer || !m_buffer || !v_buffer) {
+        cc_set_last_error("[C] execute_adam_update_on_gpu: Error - NULL buffer handle provided");
+        fprintf(stderr, "[C] execute_adam_update_on_gpu: Error - NULL buffer handle provided.\n");
+        return 0;
+    }
+    if (num_elements <= 0) {
+        if (num_elements == 0) { return 1; }
+        cc_set_last_error("[C] execute_adam_update_on_gpu: Error - Invalid non-positive number of elements (%d)", num_elements);
+        fprintf(stderr, "[C] execute_adam_update_on_gpu: Error - Invalid non-positive number of elements (%d).\n", num_elements);
+        return 0;
+    }
     if (t <= 0 || lr < 0.0f || beta1 < 0.0f || beta1 >= 1.0f || beta2 < 0.0f || beta2 >= 1.0f || eps < 0.0f || weight_decay < 0.0f) {
+         cc_set_last_error("[C] execute_adam_update_on_gpu: Error - Invalid hyperparameters (t=%d, lr=%f, b1=%f, b2=%f, eps=%f, wd=%f)",
+                           t, lr, beta1, beta2, eps, weight_decay);
          fprintf(stderr, "[C] execute_adam_update_on_gpu: Error - Invalid hyperparameters (t=%d, lr=%f, b1=%f, b2=%f, eps=%f, wd=%f).\n", t, lr, beta1, beta2, eps, weight_decay);
          return 0;
     }
-    beta1_t = (float)pow((double)beta1, (double)t);
-    beta2_t = (float)pow((double)beta2, (double)t);
+    float beta1_t = (float)pow((double)beta1, (double)t);
+    float beta2_t = (float)pow((double)beta2, (double)t);
     AdamCommandData cmd_data = { param_buffer, grad_buffer, m_buffer, v_buffer, num_elements, t, lr, beta1, beta2, eps, weight_decay, beta1_t, beta2_t };
     if (!submit_kernel_command(gpu_index, COMMAND_ADAM_UPDATE, &cmd_data)) { return 0; }
     return 1;

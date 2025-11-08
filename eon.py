@@ -14,6 +14,7 @@ from __future__ import annotations
 from dataclasses import dataclass, asdict, field
 from typing import Optional, Literal, Sequence, Tuple, Dict, Any, List, Union, Iterable
 import os
+import atexit
 import math
 import random
 import platform
@@ -83,8 +84,31 @@ class _Driver:
         resolved = _resolve_driver_path(lib_path)
         self._lib = ctypes.CDLL(resolved)
         self._configure_signatures()
+        self._closed = True
         if not self._lib.initialize_gpu(self._gpu_index):
-            raise RuntimeError("OpenCL-Initialisierung fehlgeschlagen")
+            detail = self.last_error()
+            raise RuntimeError(f"OpenCL-Initialisierung fehlgeschlagen: {detail}")
+        self._closed = False
+
+    # -- Lifecycle ------------------------------------------------------------
+    def close(self) -> None:
+        if not getattr(self, "_closed", True):
+            try:
+                self._lib.shutdown_gpu(self._gpu_index)
+            finally:
+                self._closed = True
+
+    def __enter__(self) -> "_Driver":
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        self.close()
+
+    def __del__(self) -> None:  # pragma: no cover - cleanup best effort
+        try:
+            self.close()
+        except Exception:
+            pass
 
     # -- Signaturkonfiguration -------------------------------------------------
     def _configure_signatures(self) -> None:
@@ -93,6 +117,7 @@ class _Driver:
         c_size_t = ctypes.c_size_t
         c_float = ctypes.c_float
         c_void_p = ctypes.c_void_p
+        c_char_p = ctypes.c_char_p
 
         lib.initialize_gpu.argtypes = [c_int]
         lib.initialize_gpu.restype = c_int
@@ -149,12 +174,34 @@ class _Driver:
         ]
         lib.compute_ctc_loss_cpu.restype = c_int
 
+        lib.cc_get_last_error.argtypes = []
+        lib.cc_get_last_error.restype = c_char_p
+        lib.cc_get_version.argtypes = []
+        lib.cc_get_version.restype = c_char_p
+
+    def _decode(self, raw: Optional[bytes]) -> str:
+        if not raw:
+            return ""
+        return raw.decode("utf-8", errors="replace")
+
+    def last_error(self) -> str:
+        return self._decode(self._lib.cc_get_last_error())
+
+    def version(self) -> str:
+        return self._decode(self._lib.cc_get_version()) or "unknown"
+
+    def _ensure_ok(self, ok: int, context: str) -> None:
+        if not ok:
+            raise RuntimeError(f"{context}: {self.last_error() or 'unbekannter Fehler'}")
+
     # -- Speicherverwaltung ----------------------------------------------------
     def allocate_gpu_memory(self, size: int) -> Optional[int]:
         raw = self._lib.allocate_gpu_memory(self._gpu_index, size)
-        if isinstance(raw, int):
-            return raw or None
-        return raw.value if raw else None
+        ptr = raw if isinstance(raw, int) else (raw.value if raw else None)
+        if not ptr and size:
+            detail = self.last_error()
+            raise MemoryError(f"OpenCL-Treiber konnte keinen Speicher allokieren: {detail}")
+        return ptr
 
     def free_gpu_memory(self, ptr: Optional[int]) -> None:
         if ptr:
@@ -168,8 +215,7 @@ class _Driver:
             ctypes.c_size_t(nbytes),
             ctypes.c_void_p(host_ptr),
         )
-        if not ok:
-            raise RuntimeError("GPU-Schreibvorgang fehlgeschlagen")
+        self._ensure_ok(ok, "GPU-Schreibvorgang fehlgeschlagen")
 
     def read_gpu_to_host(self, gpu_ptr: int, host_ptr: int, nbytes: int, offset: int = 0) -> None:
         ok = self._lib.read_gpu_to_host_blocking(
@@ -179,8 +225,7 @@ class _Driver:
             ctypes.c_size_t(nbytes),
             ctypes.c_void_p(host_ptr),
         )
-        if not ok:
-            raise RuntimeError("GPU-Lesevorgang fehlgeschlagen")
+        self._ensure_ok(ok, "GPU-Lesevorgang fehlgeschlagen")
 
     # -- Kernel Aufrufe --------------------------------------------------------
     def offload_conv2d_forward(
@@ -207,8 +252,7 @@ class _Driver:
             ctypes.c_void_p(out_ptr),
             B, C_in, H, W, C_out, K_h, K_w, stride_h, stride_w,
         )
-        if not ok:
-            raise RuntimeError("Conv2D Forward fehlgeschlagen")
+        self._ensure_ok(ok, "Conv2D Forward fehlgeschlagen")
 
     def offload_conv2d_backward(
         self,
@@ -238,8 +282,7 @@ class _Driver:
             ctypes.c_void_p(grad_b_ptr) if grad_b_ptr else ctypes.c_void_p(),
             B, C_in, H, W, C_out, K_h, K_w, stride_h, stride_w,
         )
-        if not ok:
-            raise RuntimeError("Conv2D Backward fehlgeschlagen")
+        self._ensure_ok(ok, "Conv2D Backward fehlgeschlagen")
 
     def offload_permute_and_reshape(self, in_ptr: int, out_ptr: int, B: int, C: int, H: int, W: int) -> None:
         ok = self._lib.execute_patch_permute_reshape_on_gpu(
@@ -248,8 +291,7 @@ class _Driver:
             ctypes.c_void_p(out_ptr),
             B, C, H, W,
         )
-        if not ok:
-            raise RuntimeError("Patch-Permute fehlgeschlagen")
+        self._ensure_ok(ok, "Patch-Permute fehlgeschlagen")
 
     def offload_reshape_and_permute_backward(self, in_ptr: int, out_ptr: int, B: int, C: int, H: int, W: int) -> None:
         ok = self._lib.execute_patch_permute_reshape_backward_on_gpu(
@@ -258,8 +300,7 @@ class _Driver:
             ctypes.c_void_p(out_ptr),
             B, C, H, W,
         )
-        if not ok:
-            raise RuntimeError("Patch-Permute-Backward fehlgeschlagen")
+        self._ensure_ok(ok, "Patch-Permute-Backward fehlgeschlagen")
 
     def execute_eon_encoder_chain(self, in_ptr: int, out_ptr: int, num_bytes: int) -> None:
         ok = self._lib.execute_eon_encoder_chain_on_gpu(
@@ -268,8 +309,7 @@ class _Driver:
             ctypes.c_void_p(out_ptr),
             ctypes.c_size_t(num_bytes),
         )
-        if not ok:
-            raise RuntimeError("Encoder-Kette konnte nicht ausgeführt werden")
+        self._ensure_ok(ok, "Encoder-Kette konnte nicht ausgeführt werden")
 
     def execute_eon_encoder_backward_chain(self, grad_out_ptr: int, grad_in_ptr: int, num_bytes: int) -> None:
         ok = self._lib.execute_eon_encoder_backward_chain_on_gpu(
@@ -278,8 +318,7 @@ class _Driver:
             ctypes.c_void_p(grad_in_ptr),
             ctypes.c_size_t(num_bytes),
         )
-        if not ok:
-            raise RuntimeError("Encoder-Backward-Kette konnte nicht ausgeführt werden")
+        self._ensure_ok(ok, "Encoder-Backward-Kette konnte nicht ausgeführt werden")
 
     def offload_adamw_update(
         self,
@@ -309,8 +348,7 @@ class _Driver:
             eps,
             weight_decay,
         )
-        if not ok:
-            raise RuntimeError("AdamW-Update fehlgeschlagen")
+        self._ensure_ok(ok, "AdamW-Update fehlgeschlagen")
 
     def offload_ctc_loss(
         self,
@@ -346,8 +384,7 @@ class _Driver:
             loss.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
             grad.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
         )
-        if not ok:
-            raise RuntimeError("CTC-Loss Berechnung fehlgeschlagen")
+        self._ensure_ok(ok, "CTC-Loss Berechnung fehlgeschlagen")
         return loss, grad
 
 
@@ -373,6 +410,7 @@ def _load_opencl_driver(lib_path: Optional[Union[str, os.PathLike]] = None) -> A
     if DRIVER is None:
         try:
             DRIVER = _Driver(lib_path=lib_path)
+            atexit.register(DRIVER.close)
             USE_OPENCL = True
         except Exception as exc:  # pragma: no cover - fallback
             print(f"[EON] Warnung: OpenCL-Treiber konnte nicht geladen werden ({exc}). Fallback aktiv.")
@@ -942,3 +980,4 @@ def train_ocr(cfg: TrainCfg) -> Dict[str, Any]:
 
 if __name__ == "__main__":
     print("EON OCR-Modul geladen. Verwenden Sie train_ocr(...) mit einer TrainCfg-Konfiguration.")
+
