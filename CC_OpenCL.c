@@ -345,6 +345,9 @@ cl_kernel dynamic_token_assign_kernel_fast = NULL;
 cl_program pairwise_similarity_program = NULL;    cl_kernel pairwise_similarity_kernel = NULL;
 cl_program pairwise_similarity_program_fast = NULL;
 cl_kernel pairwise_similarity_kernel_fast = NULL;
+cl_program fused_diffusion_program = NULL;        cl_kernel fused_diffusion_kernel = NULL;
+cl_program fused_diffusion_program_fast = NULL;
+cl_kernel fused_diffusion_kernel_fast = NULL;
 cl_program hebbian_update_local_reduce_program = NULL; cl_kernel hebbian_update_local_reduce_kernel = NULL;
 cl_program hebbian_update_local_reduce_program_fast = NULL;
 cl_kernel hebbian_update_local_reduce_kernel_fast = NULL;
@@ -918,7 +921,8 @@ typedef enum {
     COMMAND_PROTO_SEGMENTED_SUM = 34,           /**< Atomically sum activations per prototype based on indices (Requires Atomics). */
     COMMAND_PROTO_UPDATE_STEP = 35,             /**< Update prototypes using accumulated sums and counts from segmented sum. */
     COMMAND_SHAPE_LOSS_REWARD_PENALTY = 36,     /**< Adjust loss based on reward/penalty rules (single pair). */
-    COMMAND_SHAPE_LOSS_REWARD_PENALTY_LIST = 37 /**< Adjust loss based on reward/penalty rules (list of pairs). */ // NEU
+    COMMAND_SHAPE_LOSS_REWARD_PENALTY_LIST = 37,/**< Adjust loss based on reward/penalty rules (list of pairs). */ // NEU
+    COMMAND_FUSED_DIFFUSION = 38                /**< Diffusion step combining self-retention and weighted neighbor aggregation. */
 } GPUCommand;
 
 // --- Forward Declarations for Exported Functions ---
@@ -2392,6 +2396,42 @@ const char *pairwise_similarity_kernel_src =
 "        similarity[output_idx] = (FP_TYPE)dot_product;\n"
 "    }\n"
 "}";
+
+const char *fused_diffusion_kernel_src =
+"/* Performs a diffusion update mixing self-activation with weighted neighbor contributions. */\n"
+"__kernel void fused_diffusion(\n"
+"    __global const FP_TYPE *X,  /* Input activations (B, N, D) */\n"
+"    __global const FP_TYPE *W,  /* Diffusion weights (B, N, N) */\n"
+"    __global FP_TYPE *O,        /* Output activations (B, N, D) */\n"
+"    const int B,\n"
+"    const int N,\n"
+"    const int D,\n"
+"    const FP_TYPE gamma,\n"
+"    const FP_TYPE sigma) {\n"
+"    int gid = get_global_id(0);\n"
+"    int total = B * N * D;\n"
+"    if (gid >= total) {\n"
+"        return;\n"
+"    }\n"
+"\n"
+"    int d = gid % D;\n"
+"    int idx = gid / D;\n"
+"    int n = idx % N;\n"
+"    int b = idx / N;\n"
+"\n"
+"    int base_x = (b * N + n) * D + d;\n"
+"    FP_TYPE self_val = X[base_x];\n"
+"    FP_TYPE accum = (FP_TYPE)0;\n"
+"    int base_w = (b * N + n) * N;\n"
+"    int batch_offset = b * N;\n"
+"    for (int j = 0; j < N; ++j) {\n"
+"        FP_TYPE weight = W[base_w + j];\n"
+"        FP_TYPE neighbor = X[(batch_offset + j) * D + d];\n"
+"        accum += weight * neighbor;\n"
+"    }\n"
+"\n"
+"    O[base_x] = gamma * self_val + sigma * accum;\n"
+"}\n";
 // GPU Prototype Update Kernel Sources
 const char *proto_segmented_sum_atomic_kernel_src =
 "/* This kernel requires the cl_khr_global_int32_base_atomics extension */\n"
@@ -3322,6 +3362,8 @@ void shutdown_driver() {
     RELEASE_KERNEL(dynamic_token_assign_kernel_fast);
     RELEASE_KERNEL(pairwise_similarity_kernel);
     RELEASE_KERNEL(pairwise_similarity_kernel_fast);
+    RELEASE_KERNEL(fused_diffusion_kernel);
+    RELEASE_KERNEL(fused_diffusion_kernel_fast);
     RELEASE_KERNEL(hebbian_update_local_reduce_kernel);
     RELEASE_KERNEL(hebbian_update_local_reduce_kernel_fast);
     RELEASE_KERNEL(embedding_backward_calc_delta_local_kernel);
@@ -3417,6 +3459,8 @@ void shutdown_driver() {
     RELEASE_PROGRAM(dynamic_token_assign_program_fast);
     RELEASE_PROGRAM(pairwise_similarity_program);
     RELEASE_PROGRAM(pairwise_similarity_program_fast);
+    RELEASE_PROGRAM(fused_diffusion_program);
+    RELEASE_PROGRAM(fused_diffusion_program_fast);
     RELEASE_PROGRAM(hebbian_update_local_reduce_program);
     RELEASE_PROGRAM(hebbian_update_local_reduce_program_fast);
     RELEASE_PROGRAM(embedding_backward_calc_delta_local_program);
@@ -4046,6 +4090,7 @@ DLLEXPORT int initialize_gpu(int gpu_index) {
     COMPILE_KERNEL_DUAL(add_bias_mn_kernel_src, "add_bias_mn", add_bias_mn);
     COMPILE_KERNEL_DUAL(dynamic_token_assign_kernel_src, "dynamic_token_assignment", dynamic_token_assign);
     COMPILE_KERNEL_DUAL(pairwise_similarity_kernel_src, "pairwise_similarity_dot", pairwise_similarity);
+    COMPILE_KERNEL_DUAL(fused_diffusion_kernel_src, "fused_diffusion", fused_diffusion);
     COMPILE_KERNEL_DUAL(hebbian_update_local_reduce_kernel_src, "hebbian_update_local_reduce", hebbian_update_local_reduce);
     COMPILE_KERNEL_DUAL(embedding_backward_calc_delta_local_kernel_src, "embedding_backward_calc_delta_local", embedding_backward_calc_delta_local);
     COMPILE_KERNEL_DUAL(proto_segmented_sum_atomic_kernel_src, "proto_segmented_sum_atomic", proto_segmented_sum);
@@ -6859,6 +6904,16 @@ typedef struct { void* d_o; void* idx; void* delta_dw; int b; int s; int d; int 
 typedef struct { void* activations_bse; void* prototypes_te; void* output_indices_bs; int B; int S; int E; int T; } DynamicTokenAssignmentCommandData;
 typedef struct { void* states_nd; void* output_similarity_nn; int N; int D; } PairwiseSimilarityCommandData;
 typedef struct {
+    void* buffer_X;
+    void* buffer_W;
+    void* buffer_O;
+    int B;
+    int N;
+    int D;
+    float gamma;
+    float sigma;
+} FusedDiffusionCommandData;
+typedef struct {
     void* activations_flat; void* indices_flat; void* proto_sums; void* proto_counts;
     int M_flat; int E; int T;
 } ProtoSegmentedSumCommandData;
@@ -8845,6 +8900,35 @@ int submit_kernel_command(int gpu_index, GPUCommand command, void *data) {
             CHECK_CL_ERR(ENQUEUE_KERNEL_PROFILED(pairwise_similarity_kernel, 2, gws, NULL, "pairwise_similarity"), "PairwiseSim Enqueue");
             return 1;
         }
+        case COMMAND_FUSED_DIFFUSION: {
+            FusedDiffusionCommandData* cmd = (FusedDiffusionCommandData*)data;
+            if ((!fused_diffusion_kernel && !fused_diffusion_kernel_fast) || !cmd || !cmd->buffer_X || !cmd->buffer_W || !cmd->buffer_O) {
+                fprintf(stderr, "[C] Submit FusedDiffusion: Invalid args or kernel.\n");
+                return 0;
+            }
+            if (cmd->B <= 0 || cmd->N <= 0 || cmd->D <= 0) {
+                if ((size_t)cmd->B * cmd->N * cmd->D == 0) { return 1; }
+                fprintf(stderr, "[C] Submit FusedDiffusion: Invalid dimensions (B=%d, N=%d, D=%d).\n", cmd->B, cmd->N, cmd->D);
+                return 0;
+            }
+            cl_kernel kernel = fused_diffusion_kernel_fast ? fused_diffusion_kernel_fast : fused_diffusion_kernel;
+            cl_mem x_mem = (cl_mem)cmd->buffer_X;
+            cl_mem w_mem = (cl_mem)cmd->buffer_W;
+            cl_mem o_mem = (cl_mem)cmd->buffer_O;
+            CHECK_CL_ERR(clSetKernelArg(kernel, 0, sizeof(cl_mem), &x_mem), "FusedDiffusion Arg 0 (X)");
+            CHECK_CL_ERR(clSetKernelArg(kernel, 1, sizeof(cl_mem), &w_mem), "FusedDiffusion Arg 1 (W)");
+            CHECK_CL_ERR(clSetKernelArg(kernel, 2, sizeof(cl_mem), &o_mem), "FusedDiffusion Arg 2 (O)");
+            CHECK_CL_ERR(clSetKernelArg(kernel, 3, sizeof(cl_int), &cmd->B), "FusedDiffusion Arg 3 (B)");
+            CHECK_CL_ERR(clSetKernelArg(kernel, 4, sizeof(cl_int), &cmd->N), "FusedDiffusion Arg 4 (N)");
+            CHECK_CL_ERR(clSetKernelArg(kernel, 5, sizeof(cl_int), &cmd->D), "FusedDiffusion Arg 5 (D)");
+            CHECK_CL_ERR(clSetKernelArg(kernel, 6, sizeof(cl_float), &cmd->gamma), "FusedDiffusion Arg 6 (gamma)");
+            CHECK_CL_ERR(clSetKernelArg(kernel, 7, sizeof(cl_float), &cmd->sigma), "FusedDiffusion Arg 7 (sigma)");
+            size_t total = (size_t)cmd->B * (size_t)cmd->N * (size_t)cmd->D;
+            if (total == 0) { return 1; }
+            size_t gws[1] = { total };
+            CHECK_CL_ERR(ENQUEUE_KERNEL_PROFILED(kernel, 1, gws, NULL, "fused_diffusion"), "FusedDiffusion Enqueue");
+            return 1;
+        }
         case COMMAND_PROTO_SEGMENTED_SUM: {
             ProtoSegmentedSumCommandData* cmd = (ProtoSegmentedSumCommandData*)data;
             if (!proto_segmented_sum_kernel || !cmd || !cmd->activations_flat || !cmd->indices_flat || !cmd->proto_sums || !cmd->proto_counts) { fprintf(stderr, "[C] Submit Proto Segmented Sum: Error - Invalid arguments or kernel handle missing.\n"); return 0; }
@@ -9360,7 +9444,22 @@ DLLEXPORT int execute_fused_diffusion_on_gpu(
     void* buffer_O,  // float32 [B*N*D], Output
     int B, int N, int D,
     float gamma, float sigma
-);
+) {
+    if (!buffer_X || !buffer_W || !buffer_O) {
+        fprintf(stderr, "[C] execute_fused_diffusion_on_gpu: Error - NULL buffer handle provided.\n");
+        return 0;
+    }
+    if (B <= 0 || N <= 0 || D <= 0) {
+        if ((size_t)B * N * D == 0) { return 1; }
+        fprintf(stderr, "[C] execute_fused_diffusion_on_gpu: Error - Invalid non-positive dimensions (B=%d, N=%d, D=%d).\n", B, N, D);
+        return 0;
+    }
+    FusedDiffusionCommandData cmd_data = { buffer_X, buffer_W, buffer_O, B, N, D, gamma, sigma };
+    if (!submit_kernel_command(gpu_index, COMMAND_FUSED_DIFFUSION, &cmd_data)) {
+        return 0;
+    }
+    return 1;
+}
 
 DLLEXPORT int execute_shape_loss_with_reward_penalty_list_gpu(
     int gpu_index,
