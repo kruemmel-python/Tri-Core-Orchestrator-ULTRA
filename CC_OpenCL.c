@@ -348,6 +348,24 @@ cl_kernel pairwise_similarity_kernel_fast = NULL;
 cl_program fused_diffusion_program = NULL;        cl_kernel fused_diffusion_kernel = NULL;
 cl_program fused_diffusion_program_fast = NULL;
 cl_kernel fused_diffusion_kernel_fast = NULL;
+cl_program conv2d_forward_program = NULL;         cl_kernel conv2d_forward_kernel = NULL;
+cl_program conv2d_forward_program_fast = NULL;
+cl_kernel conv2d_forward_kernel_fast = NULL;
+cl_program conv2d_backward_input_program = NULL;  cl_kernel conv2d_backward_input_kernel = NULL;
+cl_program conv2d_backward_input_program_fast = NULL;
+cl_kernel conv2d_backward_input_kernel_fast = NULL;
+cl_program conv2d_backward_weight_program = NULL; cl_kernel conv2d_backward_weight_kernel = NULL;
+cl_program conv2d_backward_weight_program_fast = NULL;
+cl_kernel conv2d_backward_weight_kernel_fast = NULL;
+cl_program conv2d_bias_grad_program = NULL;       cl_kernel conv2d_bias_grad_kernel = NULL;
+cl_program conv2d_bias_grad_program_fast = NULL;
+cl_kernel conv2d_bias_grad_kernel_fast = NULL;
+cl_program patch_permute_program = NULL;          cl_kernel patch_permute_kernel = NULL;
+cl_program patch_permute_program_fast = NULL;
+cl_kernel patch_permute_kernel_fast = NULL;
+cl_program patch_permute_backward_program = NULL; cl_kernel patch_permute_backward_kernel = NULL;
+cl_program patch_permute_backward_program_fast = NULL;
+cl_kernel patch_permute_backward_kernel_fast = NULL;
 static unsigned int g_rng_seed = 0; // Einfacher Zähler für den RNG-Seed
 cl_program izhikevich_program = NULL;           cl_kernel izhikevich_kernel = NULL;
 cl_program izhikevich_program_fast = NULL;      cl_kernel izhikevich_kernel_fast = NULL;
@@ -894,6 +912,25 @@ static KernelMetricsSample g_last_metrics = {"", 0.0f, 0.0f, 0.0f};
 static float* g_measurement_error_target = NULL;
 static float* g_measurement_variance_target = NULL;
 
+static inline float cc_log_sum_exp_pair(float a, float b) {
+    if (a == -INFINITY) { return b; }
+    if (b == -INFINITY) { return a; }
+    float max_val = (a > b) ? a : b;
+    return max_val + logf(expf(a - max_val) + expf(b - max_val));
+}
+
+static inline float cc_log_sum_exp_three(float a, float b, float c) {
+    float max_val = a;
+    if (b > max_val) { max_val = b; }
+    if (c > max_val) { max_val = c; }
+    if (max_val == -INFINITY) { return -INFINITY; }
+    float sum = 0.0f;
+    if (a != -INFINITY) { sum += expf(a - max_val); }
+    if (b != -INFINITY) { sum += expf(b - max_val); }
+    if (c != -INFINITY) { sum += expf(c - max_val); }
+    return max_val + logf(sum);
+}
+
 
 /**
  * @brief Enumeration of available GPU commands that can be submitted via the driver.
@@ -944,7 +981,11 @@ typedef enum {
     COMMAND_LBM_COLLIDE_STREAM = 42,            /**< Perform a Lattice-Boltzmann collide-and-stream step (D2Q9). */
     COMMAND_NBODY_FORCES = 43,                  /**< Compute pairwise gravitational forces for N-body simulation. */
     COMMAND_NBODY_INTEGRATE = 44,               /**< Integrate N-body positions and velocities from computed forces. */
-    COMMAND_ISING_METROPOLIS = 45               /**< Metropolis update for checkerboard Ising simulation step. */
+    COMMAND_ISING_METROPOLIS = 45,              /**< Metropolis update for checkerboard Ising simulation step. */
+    COMMAND_CONV2D_FORWARD = 46,               /**< 2D convolution forward pass (NCHW). */
+    COMMAND_CONV2D_BACKWARD = 47,               /**< 2D convolution backward pass computing dInput, dWeight, dBias. */
+    COMMAND_PATCH_PERMUTE_RESHAPE = 48,         /**< Permute (0,3,2,1) and fuse reshape for patch embeddings. */
+    COMMAND_PATCH_PERMUTE_RESHAPE_BACKWARD = 49 /**< Backward permutation for patch embedding reshape. */
 } GPUCommand;
 
 // --- Forward Declarations for Exported Functions ---
@@ -2496,6 +2537,165 @@ const char *fused_diffusion_kernel_src =
 "    O[x_idx] = one_minus_gamma * self_val + gamma * mix + noise;\n"
 "}\n";
 
+const char *conv2d_forward_kernel_src =
+"__kernel void conv2d_forward(\n"
+"    __global const FP_TYPE* input,\n"
+"    __global const FP_TYPE* weights,\n"
+"    __global const FP_TYPE* bias,\n"
+"    __global FP_TYPE* output,\n"
+"    const int B, const int C_in, const int H, const int W,\n"
+"    const int C_out, const int K_h, const int K_w,\n"
+"    const int stride_h, const int stride_w,\n"
+"    const int out_h, const int out_w) {\n"
+"    int gid = get_global_id(0);\n"
+"    int total = B * C_out * out_h * out_w;\n"
+"    if (gid >= total) { return; }\n"
+"    int ow = gid % out_w;\n"
+"    int tmp = gid / out_w;\n"
+"    int oh = tmp % out_h;\n"
+"    tmp /= out_h;\n"
+"    int oc = tmp % C_out;\n"
+"    int b = tmp / C_out;\n"
+"    FP_TYPE acc = (bias ? bias[oc] : (FP_TYPE)0);\n"
+"    for (int ic = 0; ic < C_in; ++ic) {\n"
+"        for (int kh = 0; kh < K_h; ++kh) {\n"
+"            int ih = oh * stride_h + kh;\n"
+"            for (int kw = 0; kw < K_w; ++kw) {\n"
+"                int iw = ow * stride_w + kw;\n"
+"                size_t in_idx = (((size_t)b * C_in + ic) * H + ih) * W + iw;\n"
+"                size_t w_idx = ((((size_t)oc * C_in) + ic) * K_h + kh) * K_w + kw;\n"
+"                acc += weights[w_idx] * input[in_idx];\n"
+"            }\n"
+"        }\n"
+"    }\n"
+"    output[gid] = acc;\n"
+"}\n";
+
+const char *conv2d_backward_input_kernel_src =
+"__kernel void conv2d_backward_input(\n"
+"    __global const FP_TYPE* grad_output,\n"
+"    __global const FP_TYPE* weights,\n"
+"    __global FP_TYPE* grad_input,\n"
+"    const int B, const int C_in, const int H, const int W,\n"
+"    const int C_out, const int K_h, const int K_w,\n"
+"    const int stride_h, const int stride_w,\n"
+"    const int out_h, const int out_w) {\n"
+"    int gid = get_global_id(0);\n"
+"    int total = B * C_in * H * W;\n"
+"    if (gid >= total) { return; }\n"
+"    int iw = gid % W;\n"
+"    int tmp = gid / W;\n"
+"    int ih = tmp % H;\n"
+"    tmp /= H;\n"
+"    int ic = tmp % C_in;\n"
+"    int b = tmp / C_in;\n"
+"    FP_TYPE acc = (FP_TYPE)0;\n"
+"    for (int oc = 0; oc < C_out; ++oc) {\n"
+"        for (int oh = 0; oh < out_h; ++oh) {\n"
+"            int kh = ih - oh * stride_h;\n"
+"            if (kh < 0 || kh >= K_h) { continue; }\n"
+"            for (int ow = 0; ow < out_w; ++ow) {\n"
+"                int kw = iw - ow * stride_w;\n"
+"                if (kw < 0 || kw >= K_w) { continue; }\n"
+"                size_t go_idx = (((size_t)b * C_out + oc) * out_h + oh) * out_w + ow;\n"
+"                size_t w_idx = ((((size_t)oc * C_in) + ic) * K_h + kh) * K_w + kw;\n"
+"                acc += grad_output[go_idx] * weights[w_idx];\n"
+"            }\n"
+"        }\n"
+"    }\n"
+"    grad_input[gid] = acc;\n"
+"}\n";
+
+const char *conv2d_backward_weight_kernel_src =
+"__kernel void conv2d_backward_weight(\n"
+"    __global const FP_TYPE* grad_output,\n"
+"    __global const FP_TYPE* input,\n"
+"    __global FP_TYPE* grad_weight,\n"
+"    const int B, const int C_in, const int H, const int W,\n"
+"    const int C_out, const int K_h, const int K_w,\n"
+"    const int stride_h, const int stride_w,\n"
+"    const int out_h, const int out_w) {\n"
+"    int gid = get_global_id(0);\n"
+"    int total = C_out * C_in * K_h * K_w;\n"
+"    if (gid >= total) { return; }\n"
+"    int kw = gid % K_w;\n"
+"    int tmp = gid / K_w;\n"
+"    int kh = tmp % K_h;\n"
+"    tmp /= K_h;\n"
+"    int ic = tmp % C_in;\n"
+"    int oc = tmp / C_in;\n"
+"    FP_TYPE acc = (FP_TYPE)0;\n"
+"    for (int b = 0; b < B; ++b) {\n"
+"        for (int oh = 0; oh < out_h; ++oh) {\n"
+"            int ih = oh * stride_h + kh;\n"
+"            for (int ow = 0; ow < out_w; ++ow) {\n"
+"                int iw = ow * stride_w + kw;\n"
+"                size_t go_idx = (((size_t)b * C_out + oc) * out_h + oh) * out_w + ow;\n"
+"                size_t in_idx = (((size_t)b * C_in + ic) * H + ih) * W + iw;\n"
+"                acc += grad_output[go_idx] * input[in_idx];\n"
+"            }\n"
+"        }\n"
+"    }\n"
+"    grad_weight[gid] = acc;\n"
+"}\n";
+
+const char *conv2d_bias_grad_kernel_src =
+"__kernel void conv2d_bias_grad(\n"
+"    __global const FP_TYPE* grad_output,\n"
+"    __global FP_TYPE* grad_bias,\n"
+"    const int B, const int C_out, const int out_h, const int out_w) {\n"
+"    int oc = get_global_id(0);\n"
+"    if (oc >= C_out) { return; }\n"
+"    FP_TYPE acc = (FP_TYPE)0;\n"
+"    for (int b = 0; b < B; ++b) {\n"
+"        for (int oh = 0; oh < out_h; ++oh) {\n"
+"            for (int ow = 0; ow < out_w; ++ow) {\n"
+"                size_t go_idx = (((size_t)b * C_out + oc) * out_h + oh) * out_w + ow;\n"
+"                acc += grad_output[go_idx];\n"
+"            }\n"
+"        }\n"
+"    }\n"
+"    grad_bias[oc] = acc;\n"
+"}\n";
+
+const char *patch_permute_kernel_src =
+"__kernel void patch_permute_reshape(\n"
+"    __global const FP_TYPE* input,\n"
+"    __global FP_TYPE* output,\n"
+"    const int B, const int C, const int H, const int W) {\n"
+"    int gid = get_global_id(0);\n"
+"    int total = B * C * H * W;\n"
+"    if (gid >= total) { return; }\n"
+"    int w = gid % W;\n"
+"    int tmp = gid / W;\n"
+"    int h = tmp % H;\n"
+"    tmp /= H;\n"
+"    int c = tmp % C;\n"
+"    int b = tmp / C;\n"
+"    size_t in_idx = (((size_t)b * C + c) * H + h) * W + w;\n"
+"    size_t out_idx = (((size_t)b * W + w) * H + h) * C + c;\n"
+"    output[out_idx] = input[in_idx];\n"
+"}\n";
+
+const char *patch_permute_backward_kernel_src =
+"__kernel void patch_permute_reshape_backward(\n"
+"    __global const FP_TYPE* grad_tokens,\n"
+"    __global FP_TYPE* grad_feature,\n"
+"    const int B, const int C, const int H, const int W) {\n"
+"    int gid = get_global_id(0);\n"
+"    int total = B * C * H * W;\n"
+"    if (gid >= total) { return; }\n"
+"    int w = gid % W;\n"
+"    int tmp = gid / W;\n"
+"    int h = tmp % H;\n"
+"    tmp /= H;\n"
+"    int c = tmp % C;\n"
+"    int b = tmp / C;\n"
+"    size_t grad_idx = (((size_t)b * C + c) * H + h) * W + w;\n"
+"    size_t token_idx = (((size_t)b * W + w) * H + h) * C + c;\n"
+"    grad_feature[grad_idx] = grad_tokens[token_idx];\n"
+"}\n";
+
 const char *izhikevich_kernel_src =
 "/* Simuliert einen Zeitschritt des Izhikevich-Neuronmodells mit Heun-Integration. */\n"
 "__kernel void izhikevich_neuron_step(\n"
@@ -3661,6 +3861,18 @@ void shutdown_driver() {
     RELEASE_KERNEL(pairwise_similarity_kernel_fast);
     RELEASE_KERNEL(fused_diffusion_kernel);
     RELEASE_KERNEL(fused_diffusion_kernel_fast);
+    RELEASE_KERNEL(conv2d_forward_kernel);
+    RELEASE_KERNEL(conv2d_forward_kernel_fast);
+    RELEASE_KERNEL(conv2d_backward_input_kernel);
+    RELEASE_KERNEL(conv2d_backward_input_kernel_fast);
+    RELEASE_KERNEL(conv2d_backward_weight_kernel);
+    RELEASE_KERNEL(conv2d_backward_weight_kernel_fast);
+    RELEASE_KERNEL(conv2d_bias_grad_kernel);
+    RELEASE_KERNEL(conv2d_bias_grad_kernel_fast);
+    RELEASE_KERNEL(patch_permute_kernel);
+    RELEASE_KERNEL(patch_permute_kernel_fast);
+    RELEASE_KERNEL(patch_permute_backward_kernel);
+    RELEASE_KERNEL(patch_permute_backward_kernel_fast);
     RELEASE_KERNEL(izhikevich_kernel);
     RELEASE_KERNEL(izhikevich_kernel_fast);
     RELEASE_KERNEL(stdp_update_kernel);
@@ -3772,6 +3984,18 @@ void shutdown_driver() {
     RELEASE_PROGRAM(pairwise_similarity_program_fast);
     RELEASE_PROGRAM(fused_diffusion_program);
     RELEASE_PROGRAM(fused_diffusion_program_fast);
+    RELEASE_PROGRAM(conv2d_forward_program);
+    RELEASE_PROGRAM(conv2d_forward_program_fast);
+    RELEASE_PROGRAM(conv2d_backward_input_program);
+    RELEASE_PROGRAM(conv2d_backward_input_program_fast);
+    RELEASE_PROGRAM(conv2d_backward_weight_program);
+    RELEASE_PROGRAM(conv2d_backward_weight_program_fast);
+    RELEASE_PROGRAM(conv2d_bias_grad_program);
+    RELEASE_PROGRAM(conv2d_bias_grad_program_fast);
+    RELEASE_PROGRAM(patch_permute_program);
+    RELEASE_PROGRAM(patch_permute_program_fast);
+    RELEASE_PROGRAM(patch_permute_backward_program);
+    RELEASE_PROGRAM(patch_permute_backward_program_fast);
     RELEASE_PROGRAM(izhikevich_program);
     RELEASE_PROGRAM(izhikevich_program_fast);
     RELEASE_PROGRAM(stdp_update_program);
@@ -4416,6 +4640,12 @@ DLLEXPORT int initialize_gpu(int gpu_index) {
     COMPILE_KERNEL_DUAL(dynamic_token_assign_kernel_src, "dynamic_token_assignment", dynamic_token_assign);
     COMPILE_KERNEL_DUAL(pairwise_similarity_kernel_src, "pairwise_similarity_dot", pairwise_similarity);
     COMPILE_KERNEL_DUAL(fused_diffusion_kernel_src, "fused_diffusion", fused_diffusion);
+    COMPILE_KERNEL_DUAL(conv2d_forward_kernel_src, "conv2d_forward", conv2d_forward);
+    COMPILE_KERNEL_DUAL(conv2d_backward_input_kernel_src, "conv2d_backward_input", conv2d_backward_input);
+    COMPILE_KERNEL_DUAL(conv2d_backward_weight_kernel_src, "conv2d_backward_weight", conv2d_backward_weight);
+    COMPILE_KERNEL_DUAL(conv2d_bias_grad_kernel_src, "conv2d_bias_grad", conv2d_bias_grad);
+    COMPILE_KERNEL_DUAL(patch_permute_kernel_src, "patch_permute_reshape", patch_permute);
+    COMPILE_KERNEL_DUAL(patch_permute_backward_kernel_src, "patch_permute_reshape_backward", patch_permute_backward);
     COMPILE_KERNEL_DUAL(izhikevich_kernel_src, "izhikevich_neuron_step", izhikevich);
     COMPILE_KERNEL_DUAL(stdp_update_kernel_src, "stdp_update_step", stdp_update);
     COMPILE_KERNEL_DUAL(stdp_trace_kernel_src, "stdp_update_traces", stdp_trace);
@@ -7282,6 +7512,50 @@ typedef struct {
     int post_n;
 } STDPTraceCommandData;
 typedef struct {
+    void* input;
+    void* weights;
+    void* bias;
+    void* output;
+    int B;
+    int C_in;
+    int H;
+    int W;
+    int C_out;
+    int K_h;
+    int K_w;
+    int stride_h;
+    int stride_w;
+    int out_h;
+    int out_w;
+} Conv2DForwardCommandData;
+typedef struct {
+    void* grad_output;
+    void* input;
+    void* weights;
+    void* grad_input;
+    void* grad_weights;
+    void* grad_bias;
+    int B;
+    int C_in;
+    int H;
+    int W;
+    int C_out;
+    int K_h;
+    int K_w;
+    int stride_h;
+    int stride_w;
+    int out_h;
+    int out_w;
+} Conv2DBackwardCommandData;
+typedef struct {
+    void* input;
+    void* output;
+    int B;
+    int C;
+    int H;
+    int W;
+} PatchPermuteCommandData;
+typedef struct {
     void* f_in;
     void* f_out;
     void* rho;
@@ -9657,6 +9931,171 @@ int submit_kernel_command(int gpu_index, GPUCommand command, void *data) {
         }
         // --- Ende NEU: Loss Shaping (List) ---
 
+        case COMMAND_CONV2D_FORWARD: {
+            Conv2DForwardCommandData* cmd = (Conv2DForwardCommandData*)data;
+            if (!cmd || !cmd->input || !cmd->weights || !cmd->output) {
+                fprintf(stderr, "[C] Submit Conv2D Forward: Invalid command data or buffers.\n");
+                return 0;
+            }
+            if (cmd->B <= 0 || cmd->C_in <= 0 || cmd->H <= 0 || cmd->W <= 0 ||
+                cmd->C_out <= 0 || cmd->K_h <= 0 || cmd->K_w <= 0 ||
+                cmd->stride_h <= 0 || cmd->stride_w <= 0 ||
+                cmd->out_h <= 0 || cmd->out_w <= 0) {
+                if ((size_t)cmd->B * cmd->C_out * cmd->out_h * cmd->out_w == 0) { return 1; }
+                fprintf(stderr, "[C] Submit Conv2D Forward: Invalid dimensions.\n");
+                return 0;
+            }
+            cl_kernel kernel = conv2d_forward_kernel_fast ? conv2d_forward_kernel_fast : conv2d_forward_kernel;
+            if (!kernel) { fprintf(stderr, "[C] Submit Conv2D Forward: Kernel not compiled.\n"); return 0; }
+            cl_mem in_mem = (cl_mem)cmd->input;
+            cl_mem w_mem = (cl_mem)cmd->weights;
+            cl_mem b_mem = cmd->bias ? (cl_mem)cmd->bias : NULL;
+            cl_mem out_mem = (cl_mem)cmd->output;
+            CHECK_CL_ERR(clSetKernelArg(kernel, 0, sizeof(cl_mem), &in_mem), "Conv2D Fwd Arg 0");
+            CHECK_CL_ERR(clSetKernelArg(kernel, 1, sizeof(cl_mem), &w_mem), "Conv2D Fwd Arg 1");
+            CHECK_CL_ERR(clSetKernelArg(kernel, 2, sizeof(cl_mem), &b_mem), "Conv2D Fwd Arg 2");
+            CHECK_CL_ERR(clSetKernelArg(kernel, 3, sizeof(cl_mem), &out_mem), "Conv2D Fwd Arg 3");
+            CHECK_CL_ERR(clSetKernelArg(kernel, 4, sizeof(cl_int), &cmd->B), "Conv2D Fwd Arg 4");
+            CHECK_CL_ERR(clSetKernelArg(kernel, 5, sizeof(cl_int), &cmd->C_in), "Conv2D Fwd Arg 5");
+            CHECK_CL_ERR(clSetKernelArg(kernel, 6, sizeof(cl_int), &cmd->H), "Conv2D Fwd Arg 6");
+            CHECK_CL_ERR(clSetKernelArg(kernel, 7, sizeof(cl_int), &cmd->W), "Conv2D Fwd Arg 7");
+            CHECK_CL_ERR(clSetKernelArg(kernel, 8, sizeof(cl_int), &cmd->C_out), "Conv2D Fwd Arg 8");
+            CHECK_CL_ERR(clSetKernelArg(kernel, 9, sizeof(cl_int), &cmd->K_h), "Conv2D Fwd Arg 9");
+            CHECK_CL_ERR(clSetKernelArg(kernel,10, sizeof(cl_int), &cmd->K_w), "Conv2D Fwd Arg 10");
+            CHECK_CL_ERR(clSetKernelArg(kernel,11, sizeof(cl_int), &cmd->stride_h), "Conv2D Fwd Arg 11");
+            CHECK_CL_ERR(clSetKernelArg(kernel,12, sizeof(cl_int), &cmd->stride_w), "Conv2D Fwd Arg 12");
+            CHECK_CL_ERR(clSetKernelArg(kernel,13, sizeof(cl_int), &cmd->out_h), "Conv2D Fwd Arg 13");
+            CHECK_CL_ERR(clSetKernelArg(kernel,14, sizeof(cl_int), &cmd->out_w), "Conv2D Fwd Arg 14");
+            size_t gws[1] = { (size_t)cmd->B * cmd->C_out * cmd->out_h * cmd->out_w };
+            CHECK_CL_ERR(ENQUEUE_KERNEL_PROFILED(kernel, 1, gws, NULL, "conv2d_forward"), "Conv2D Forward Enqueue");
+            return 1;
+        }
+        case COMMAND_CONV2D_BACKWARD: {
+            Conv2DBackwardCommandData* cmd = (Conv2DBackwardCommandData*)data;
+            if (!cmd || !cmd->grad_output || !cmd->input || !cmd->weights) {
+                fprintf(stderr, "[C] Submit Conv2D Backward: Missing required buffers.\n");
+                return 0;
+            }
+            if (!cmd->grad_input && !cmd->grad_weights && !cmd->grad_bias) { return 1; }
+            if (cmd->B <= 0 || cmd->C_in <= 0 || cmd->H <= 0 || cmd->W <= 0 ||
+                cmd->C_out <= 0 || cmd->K_h <= 0 || cmd->K_w <= 0 ||
+                cmd->stride_h <= 0 || cmd->stride_w <= 0 ||
+                cmd->out_h <= 0 || cmd->out_w <= 0) {
+                if ((size_t)cmd->B * cmd->C_out * cmd->out_h * cmd->out_w == 0) { return 1; }
+                fprintf(stderr, "[C] Submit Conv2D Backward: Invalid dimensions.\n");
+                return 0;
+            }
+            cl_kernel k_input = (cmd->grad_input && conv2d_backward_input_kernel_fast)
+                                    ? conv2d_backward_input_kernel_fast : conv2d_backward_input_kernel;
+            cl_kernel k_weight = (cmd->grad_weights && conv2d_backward_weight_kernel_fast)
+                                    ? conv2d_backward_weight_kernel_fast : conv2d_backward_weight_kernel;
+            cl_kernel k_bias = (cmd->grad_bias && conv2d_bias_grad_kernel_fast)
+                                    ? conv2d_bias_grad_kernel_fast : conv2d_bias_grad_kernel;
+            cl_mem go_mem = (cl_mem)cmd->grad_output;
+            cl_mem in_mem = (cl_mem)cmd->input;
+            cl_mem w_mem = (cl_mem)cmd->weights;
+            if (cmd->grad_input && k_input) {
+                cl_mem gi_mem = (cl_mem)cmd->grad_input;
+                CHECK_CL_ERR(clSetKernelArg(k_input, 0, sizeof(cl_mem), &go_mem), "Conv2D dInput Arg 0");
+                CHECK_CL_ERR(clSetKernelArg(k_input, 1, sizeof(cl_mem), &w_mem), "Conv2D dInput Arg 1");
+                CHECK_CL_ERR(clSetKernelArg(k_input, 2, sizeof(cl_mem), &gi_mem), "Conv2D dInput Arg 2");
+                CHECK_CL_ERR(clSetKernelArg(k_input, 3, sizeof(cl_int), &cmd->B), "Conv2D dInput Arg 3");
+                CHECK_CL_ERR(clSetKernelArg(k_input, 4, sizeof(cl_int), &cmd->C_in), "Conv2D dInput Arg 4");
+                CHECK_CL_ERR(clSetKernelArg(k_input, 5, sizeof(cl_int), &cmd->H), "Conv2D dInput Arg 5");
+                CHECK_CL_ERR(clSetKernelArg(k_input, 6, sizeof(cl_int), &cmd->W), "Conv2D dInput Arg 6");
+                CHECK_CL_ERR(clSetKernelArg(k_input, 7, sizeof(cl_int), &cmd->C_out), "Conv2D dInput Arg 7");
+                CHECK_CL_ERR(clSetKernelArg(k_input, 8, sizeof(cl_int), &cmd->K_h), "Conv2D dInput Arg 8");
+                CHECK_CL_ERR(clSetKernelArg(k_input, 9, sizeof(cl_int), &cmd->K_w), "Conv2D dInput Arg 9");
+                CHECK_CL_ERR(clSetKernelArg(k_input,10, sizeof(cl_int), &cmd->stride_h), "Conv2D dInput Arg 10");
+                CHECK_CL_ERR(clSetKernelArg(k_input,11, sizeof(cl_int), &cmd->stride_w), "Conv2D dInput Arg 11");
+                CHECK_CL_ERR(clSetKernelArg(k_input,12, sizeof(cl_int), &cmd->out_h), "Conv2D dInput Arg 12");
+                CHECK_CL_ERR(clSetKernelArg(k_input,13, sizeof(cl_int), &cmd->out_w), "Conv2D dInput Arg 13");
+                size_t gws_in[1] = { (size_t)cmd->B * cmd->C_in * cmd->H * cmd->W };
+                CHECK_CL_ERR(ENQUEUE_KERNEL_PROFILED(k_input, 1, gws_in, NULL, "conv2d_backward_input"), "Conv2D Backward Input Enqueue");
+            }
+            if (cmd->grad_weights && k_weight) {
+                cl_mem gw_mem = (cl_mem)cmd->grad_weights;
+                CHECK_CL_ERR(clSetKernelArg(k_weight, 0, sizeof(cl_mem), &go_mem), "Conv2D dWeight Arg 0");
+                CHECK_CL_ERR(clSetKernelArg(k_weight, 1, sizeof(cl_mem), &in_mem), "Conv2D dWeight Arg 1");
+                CHECK_CL_ERR(clSetKernelArg(k_weight, 2, sizeof(cl_mem), &gw_mem), "Conv2D dWeight Arg 2");
+                CHECK_CL_ERR(clSetKernelArg(k_weight, 3, sizeof(cl_int), &cmd->B), "Conv2D dWeight Arg 3");
+                CHECK_CL_ERR(clSetKernelArg(k_weight, 4, sizeof(cl_int), &cmd->C_in), "Conv2D dWeight Arg 4");
+                CHECK_CL_ERR(clSetKernelArg(k_weight, 5, sizeof(cl_int), &cmd->H), "Conv2D dWeight Arg 5");
+                CHECK_CL_ERR(clSetKernelArg(k_weight, 6, sizeof(cl_int), &cmd->W), "Conv2D dWeight Arg 6");
+                CHECK_CL_ERR(clSetKernelArg(k_weight, 7, sizeof(cl_int), &cmd->C_out), "Conv2D dWeight Arg 7");
+                CHECK_CL_ERR(clSetKernelArg(k_weight, 8, sizeof(cl_int), &cmd->K_h), "Conv2D dWeight Arg 8");
+                CHECK_CL_ERR(clSetKernelArg(k_weight, 9, sizeof(cl_int), &cmd->K_w), "Conv2D dWeight Arg 9");
+                CHECK_CL_ERR(clSetKernelArg(k_weight,10, sizeof(cl_int), &cmd->stride_h), "Conv2D dWeight Arg 10");
+                CHECK_CL_ERR(clSetKernelArg(k_weight,11, sizeof(cl_int), &cmd->stride_w), "Conv2D dWeight Arg 11");
+                CHECK_CL_ERR(clSetKernelArg(k_weight,12, sizeof(cl_int), &cmd->out_h), "Conv2D dWeight Arg 12");
+                CHECK_CL_ERR(clSetKernelArg(k_weight,13, sizeof(cl_int), &cmd->out_w), "Conv2D dWeight Arg 13");
+                size_t gws_w[1] = { (size_t)cmd->C_out * cmd->C_in * cmd->K_h * cmd->K_w };
+                CHECK_CL_ERR(ENQUEUE_KERNEL_PROFILED(k_weight, 1, gws_w, NULL, "conv2d_backward_weight"), "Conv2D Backward Weight Enqueue");
+            }
+            if (cmd->grad_bias && k_bias) {
+                cl_mem gb_mem = (cl_mem)cmd->grad_bias;
+                CHECK_CL_ERR(clSetKernelArg(k_bias, 0, sizeof(cl_mem), &go_mem), "Conv2D dBias Arg 0");
+                CHECK_CL_ERR(clSetKernelArg(k_bias, 1, sizeof(cl_mem), &gb_mem), "Conv2D dBias Arg 1");
+                CHECK_CL_ERR(clSetKernelArg(k_bias, 2, sizeof(cl_int), &cmd->B), "Conv2D dBias Arg 2");
+                CHECK_CL_ERR(clSetKernelArg(k_bias, 3, sizeof(cl_int), &cmd->C_out), "Conv2D dBias Arg 3");
+                CHECK_CL_ERR(clSetKernelArg(k_bias, 4, sizeof(cl_int), &cmd->out_h), "Conv2D dBias Arg 4");
+                CHECK_CL_ERR(clSetKernelArg(k_bias, 5, sizeof(cl_int), &cmd->out_w), "Conv2D dBias Arg 5");
+                size_t gws_b[1] = { (size_t)cmd->C_out };
+                CHECK_CL_ERR(ENQUEUE_KERNEL_PROFILED(k_bias, 1, gws_b, NULL, "conv2d_bias_grad"), "Conv2D Bias Grad Enqueue");
+            }
+            return 1;
+        }
+        case COMMAND_PATCH_PERMUTE_RESHAPE: {
+            PatchPermuteCommandData* cmd = (PatchPermuteCommandData*)data;
+            if (!cmd || !cmd->input || !cmd->output) {
+                fprintf(stderr, "[C] Submit PatchPermute: Invalid buffers.\n");
+                return 0;
+            }
+            if (cmd->B <= 0 || cmd->C <= 0 || cmd->H <= 0 || cmd->W <= 0) {
+                if ((size_t)cmd->B * cmd->C * cmd->H * cmd->W == 0) { return 1; }
+                fprintf(stderr, "[C] Submit PatchPermute: Invalid dimensions.\n");
+                return 0;
+            }
+            cl_kernel kernel = patch_permute_kernel_fast ? patch_permute_kernel_fast : patch_permute_kernel;
+            if (!kernel) { fprintf(stderr, "[C] Submit PatchPermute: Kernel not compiled.\n"); return 0; }
+            cl_mem in_mem = (cl_mem)cmd->input;
+            cl_mem out_mem = (cl_mem)cmd->output;
+            CHECK_CL_ERR(clSetKernelArg(kernel, 0, sizeof(cl_mem), &in_mem), "PatchPermute Arg 0");
+            CHECK_CL_ERR(clSetKernelArg(kernel, 1, sizeof(cl_mem), &out_mem), "PatchPermute Arg 1");
+            CHECK_CL_ERR(clSetKernelArg(kernel, 2, sizeof(cl_int), &cmd->B), "PatchPermute Arg 2");
+            CHECK_CL_ERR(clSetKernelArg(kernel, 3, sizeof(cl_int), &cmd->C), "PatchPermute Arg 3");
+            CHECK_CL_ERR(clSetKernelArg(kernel, 4, sizeof(cl_int), &cmd->H), "PatchPermute Arg 4");
+            CHECK_CL_ERR(clSetKernelArg(kernel, 5, sizeof(cl_int), &cmd->W), "PatchPermute Arg 5");
+            size_t gws[1] = { (size_t)cmd->B * cmd->C * cmd->H * cmd->W };
+            CHECK_CL_ERR(ENQUEUE_KERNEL_PROFILED(kernel, 1, gws, NULL, "patch_permute_reshape"), "PatchPermute Enqueue");
+            return 1;
+        }
+        case COMMAND_PATCH_PERMUTE_RESHAPE_BACKWARD: {
+            PatchPermuteCommandData* cmd = (PatchPermuteCommandData*)data;
+            if (!cmd || !cmd->input || !cmd->output) {
+                fprintf(stderr, "[C] Submit PatchPermute Bwd: Invalid buffers.\n");
+                return 0;
+            }
+            if (cmd->B <= 0 || cmd->C <= 0 || cmd->H <= 0 || cmd->W <= 0) {
+                if ((size_t)cmd->B * cmd->C * cmd->H * cmd->W == 0) { return 1; }
+                fprintf(stderr, "[C] Submit PatchPermute Bwd: Invalid dimensions.\n");
+                return 0;
+            }
+            cl_kernel kernel = patch_permute_backward_kernel_fast ? patch_permute_backward_kernel_fast : patch_permute_backward_kernel;
+            if (!kernel) { fprintf(stderr, "[C] Submit PatchPermute Bwd: Kernel not compiled.\n"); return 0; }
+            cl_mem in_mem = (cl_mem)cmd->input;
+            cl_mem out_mem = (cl_mem)cmd->output;
+            CHECK_CL_ERR(clSetKernelArg(kernel, 0, sizeof(cl_mem), &in_mem), "PatchPermuteBwd Arg 0");
+            CHECK_CL_ERR(clSetKernelArg(kernel, 1, sizeof(cl_mem), &out_mem), "PatchPermuteBwd Arg 1");
+            CHECK_CL_ERR(clSetKernelArg(kernel, 2, sizeof(cl_int), &cmd->B), "PatchPermuteBwd Arg 2");
+            CHECK_CL_ERR(clSetKernelArg(kernel, 3, sizeof(cl_int), &cmd->C), "PatchPermuteBwd Arg 3");
+            CHECK_CL_ERR(clSetKernelArg(kernel, 4, sizeof(cl_int), &cmd->H), "PatchPermuteBwd Arg 4");
+            CHECK_CL_ERR(clSetKernelArg(kernel, 5, sizeof(cl_int), &cmd->W), "PatchPermuteBwd Arg 5");
+            size_t gws[1] = { (size_t)cmd->B * cmd->C * cmd->H * cmd->W };
+            CHECK_CL_ERR(ENQUEUE_KERNEL_PROFILED(kernel, 1, gws, NULL, "patch_permute_reshape_backward"), "PatchPermute Bwd Enqueue");
+            return 1;
+        }
+
         default:
             fprintf(stderr, "[C] submit_kernel_command: Error - Unknown or unhandled command code: %d\n", command);
             return 0;
@@ -9737,6 +10176,336 @@ DLLEXPORT int execute_mul_on_gpu(int gpu_index, void* buffer_a, void* buffer_b, 
     if (!submit_kernel_command(gpu_index, COMMAND_MUL_ELEMENTWISE, &cmd_data)) { return 0; }
     return 1;
 }
+
+DLLEXPORT int execute_conv2d_forward_on_gpu(
+    int gpu_index,
+    void* input,
+    void* weights,
+    void* bias,
+    void* output,
+    int B,
+    int C_in,
+    int H,
+    int W,
+    int C_out,
+    int K_h,
+    int K_w,
+    int stride_h,
+    int stride_w
+) {
+    if (!input || !weights || !output) {
+        fprintf(stderr, "[C] execute_conv2d_forward_on_gpu: Error - NULL buffer handle provided.\n");
+        return 0;
+    }
+    if (B <= 0 || C_in <= 0 || H <= 0 || W <= 0 || C_out <= 0 || K_h <= 0 || K_w <= 0 || stride_h <= 0 || stride_w <= 0) {
+        if ((size_t)B * C_out == 0) { return 1; }
+        fprintf(stderr, "[C] execute_conv2d_forward_on_gpu: Error - Invalid dimensions (B=%d, Cin=%d, H=%d, W=%d, Cout=%d, Kh=%d, Kw=%d, Sh=%d, Sw=%d).\n",
+                B, C_in, H, W, C_out, K_h, K_w, stride_h, stride_w);
+        return 0;
+    }
+    int out_h = (H - K_h) / stride_h + 1;
+    int out_w = (W - K_w) / stride_w + 1;
+    if (out_h <= 0 || out_w <= 0) {
+        fprintf(stderr, "[C] execute_conv2d_forward_on_gpu: Error - Output dimensions non-positive (out_h=%d, out_w=%d).\n", out_h, out_w);
+        return 0;
+    }
+    Conv2DForwardCommandData cmd = { input, weights, bias, output, B, C_in, H, W, C_out, K_h, K_w, stride_h, stride_w, out_h, out_w };
+    if (!submit_kernel_command(gpu_index, COMMAND_CONV2D_FORWARD, &cmd)) { return 0; }
+    return 1;
+}
+
+DLLEXPORT int execute_conv2d_backward_on_gpu(
+    int gpu_index,
+    void* grad_output,
+    void* input,
+    void* weights,
+    void* grad_input,
+    void* grad_weights,
+    void* grad_bias,
+    int B,
+    int C_in,
+    int H,
+    int W,
+    int C_out,
+    int K_h,
+    int K_w,
+    int stride_h,
+    int stride_w
+) {
+    if (!grad_output || !input || !weights) {
+        fprintf(stderr, "[C] execute_conv2d_backward_on_gpu: Error - NULL required buffer provided.\n");
+        return 0;
+    }
+    if (!grad_input && !grad_weights && !grad_bias) { return 1; }
+    if (B <= 0 || C_in <= 0 || H <= 0 || W <= 0 || C_out <= 0 || K_h <= 0 || K_w <= 0 || stride_h <= 0 || stride_w <= 0) {
+        if ((size_t)B * C_out == 0) { return 1; }
+        fprintf(stderr, "[C] execute_conv2d_backward_on_gpu: Error - Invalid dimensions (B=%d, Cin=%d, H=%d, W=%d, Cout=%d, Kh=%d, Kw=%d, Sh=%d, Sw=%d).\n",
+                B, C_in, H, W, C_out, K_h, K_w, stride_h, stride_w);
+        return 0;
+    }
+    int out_h = (H - K_h) / stride_h + 1;
+    int out_w = (W - K_w) / stride_w + 1;
+    if (out_h <= 0 || out_w <= 0) {
+        fprintf(stderr, "[C] execute_conv2d_backward_on_gpu: Error - Output dimensions non-positive (out_h=%d, out_w=%d).\n", out_h, out_w);
+        return 0;
+    }
+    Conv2DBackwardCommandData cmd = { grad_output, input, weights, grad_input, grad_weights, grad_bias,
+                                      B, C_in, H, W, C_out, K_h, K_w, stride_h, stride_w, out_h, out_w };
+    if (!submit_kernel_command(gpu_index, COMMAND_CONV2D_BACKWARD, &cmd)) { return 0; }
+    return 1;
+}
+
+DLLEXPORT int execute_patch_permute_reshape_on_gpu(int gpu_index, void* input, void* output, int B, int C, int H, int W) {
+    if (!input || !output) {
+        fprintf(stderr, "[C] execute_patch_permute_reshape_on_gpu: Error - NULL buffer handle provided.\n");
+        return 0;
+    }
+    if (B <= 0 || C <= 0 || H <= 0 || W <= 0) {
+        if ((size_t)B * C * H * W == 0) { return 1; }
+        fprintf(stderr, "[C] execute_patch_permute_reshape_on_gpu: Error - Invalid dimensions (B=%d, C=%d, H=%d, W=%d).\n", B, C, H, W);
+        return 0;
+    }
+    PatchPermuteCommandData cmd = { input, output, B, C, H, W };
+    if (!submit_kernel_command(gpu_index, COMMAND_PATCH_PERMUTE_RESHAPE, &cmd)) { return 0; }
+    return 1;
+}
+
+DLLEXPORT int execute_patch_permute_reshape_backward_on_gpu(int gpu_index, void* grad_tokens, void* grad_feature, int B, int C, int H, int W) {
+    if (!grad_tokens || !grad_feature) {
+        fprintf(stderr, "[C] execute_patch_permute_reshape_backward_on_gpu: Error - NULL buffer handle provided.\n");
+        return 0;
+    }
+    if (B <= 0 || C <= 0 || H <= 0 || W <= 0) {
+        if ((size_t)B * C * H * W == 0) { return 1; }
+        fprintf(stderr, "[C] execute_patch_permute_reshape_backward_on_gpu: Error - Invalid dimensions (B=%d, C=%d, H=%d, W=%d).\n", B, C, H, W);
+        return 0;
+    }
+    PatchPermuteCommandData cmd = { grad_tokens, grad_feature, B, C, H, W };
+    if (!submit_kernel_command(gpu_index, COMMAND_PATCH_PERMUTE_RESHAPE_BACKWARD, &cmd)) { return 0; }
+    return 1;
+}
+
+DLLEXPORT int execute_eon_encoder_chain_on_gpu(int gpu_index, void* buffer_input, void* buffer_output, size_t num_bytes) {
+    if (!buffer_input || !buffer_output) {
+        fprintf(stderr, "[C] execute_eon_encoder_chain_on_gpu: Error - NULL buffer handle provided.\n");
+        return 0;
+    }
+    if (num_bytes == 0) { return 1; }
+    CloneCommandData cmd = { buffer_input, buffer_output, num_bytes };
+    if (!submit_kernel_command(gpu_index, COMMAND_CLONE, &cmd)) { return 0; }
+    return 1;
+}
+
+DLLEXPORT int execute_eon_encoder_backward_chain_on_gpu(int gpu_index, void* buffer_grad_output, void* buffer_grad_input, size_t num_bytes) {
+    if (!buffer_grad_output || !buffer_grad_input) {
+        fprintf(stderr, "[C] execute_eon_encoder_backward_chain_on_gpu: Error - NULL buffer handle provided.\n");
+        return 0;
+    }
+    if (num_bytes == 0) { return 1; }
+    CloneCommandData cmd = { buffer_grad_output, buffer_grad_input, num_bytes };
+    if (!submit_kernel_command(gpu_index, COMMAND_CLONE, &cmd)) { return 0; }
+    return 1;
+}
+
+DLLEXPORT int compute_ctc_loss_cpu(
+    const float* logits,
+    int T,
+    int B,
+    int V,
+    const int* targets,
+    int max_target_len,
+    const int* target_lengths,
+    const int* input_lengths,
+    int blank_index,
+    float* loss_out,
+    float* grad_out
+) {
+    if (!logits || !targets || !target_lengths || !input_lengths || !loss_out) {
+        fprintf(stderr, "[C] compute_ctc_loss_cpu: Error - NULL required pointer provided.\n");
+        return 0;
+    }
+    if (T <= 0 || B <= 0 || V <= 0 || max_target_len < 0) {
+        fprintf(stderr, "[C] compute_ctc_loss_cpu: Error - Invalid dimensions (T=%d, B=%d, V=%d, max_target_len=%d).\n", T, B, V, max_target_len);
+        return 0;
+    }
+    if (blank_index < 0 || blank_index >= V) {
+        fprintf(stderr, "[C] compute_ctc_loss_cpu: Error - Invalid blank index %d for vocab size %d.\n", blank_index, V);
+        return 0;
+    }
+
+    const float log_zero = -1e30f;
+    size_t total_elements = (size_t)T * (size_t)V;
+    float* log_probs = (float*)malloc(total_elements * sizeof(float));
+    float* probs = (float*)malloc(total_elements * sizeof(float));
+    if (!log_probs || !probs) {
+        fprintf(stderr, "[C] compute_ctc_loss_cpu: Error - Failed to allocate intermediate buffers.\n");
+        free(log_probs);
+        free(probs);
+        return 0;
+    }
+    if (grad_out) {
+        memset(grad_out, 0, (size_t)B * total_elements * sizeof(float));
+    }
+
+    for (int b = 0; b < B; ++b) {
+        int T_b = input_lengths[b];
+        int L_b = target_lengths[b];
+        if (T_b <= 0 || T_b > T) {
+            fprintf(stderr, "[C] compute_ctc_loss_cpu: Warning - Adjusting invalid input length %d for batch %d.\n", T_b, b);
+            T_b = T;
+        }
+        if (L_b < 0 || L_b > max_target_len) {
+            fprintf(stderr, "[C] compute_ctc_loss_cpu: Warning - Adjusting invalid target length %d for batch %d.\n", L_b, b);
+            L_b = (L_b < 0) ? 0 : max_target_len;
+        }
+        const float* logits_b = logits + (size_t)b * total_elements;
+        float* log_probs_b = log_probs;
+        float* probs_b = probs;
+
+        for (int t = 0; t < T; ++t) {
+            const float* logits_t = logits_b + (size_t)t * V;
+            float* log_probs_t = log_probs_b + (size_t)t * V;
+            float* probs_t = probs_b + (size_t)t * V;
+            float max_logit = logits_t[0];
+            for (int k = 1; k < V; ++k) {
+                if (logits_t[k] > max_logit) { max_logit = logits_t[k]; }
+            }
+            float denom = 0.0f;
+            for (int k = 0; k < V; ++k) {
+                float val = expf(logits_t[k] - max_logit);
+                denom += val;
+                probs_t[k] = val;
+            }
+            float log_denom = max_logit + logf(denom);
+            for (int k = 0; k < V; ++k) {
+                probs_t[k] /= denom;
+                log_probs_t[k] = logits_t[k] - log_denom;
+            }
+        }
+
+        if (T_b == 0) {
+            loss_out[b] = 0.0f;
+            continue;
+        }
+
+        int S = 2 * L_b + 1;
+        if (S <= 0) { S = 1; }
+        int* ext = (int*)malloc((size_t)S * sizeof(int));
+        float* alpha = (float*)malloc((size_t)T_b * S * sizeof(float));
+        float* beta = (float*)malloc((size_t)T_b * S * sizeof(float));
+        if (!ext || !alpha || !beta) {
+            fprintf(stderr, "[C] compute_ctc_loss_cpu: Error - Failed to allocate DP buffers.\n");
+            free(ext); free(alpha); free(beta);
+            free(log_probs); free(probs);
+            return 0;
+        }
+
+        for (int i = 0; i < S; ++i) { ext[i] = blank_index; }
+        for (int l = 0; l < L_b; ++l) { ext[2 * l + 1] = targets[b * max_target_len + l]; }
+
+        for (int i = 0; i < T_b * S; ++i) { alpha[i] = beta[i] = log_zero; }
+        const float* log_probs_bt0 = log_probs_b;
+        alpha[0 * S + 0] = log_probs_bt0[blank_index];
+        if (S > 1) {
+            int sym = ext[1];
+            if (sym >= 0 && sym < V) { alpha[0 * S + 1] = log_probs_bt0[sym]; }
+        }
+
+        for (int t = 1; t < T_b; ++t) {
+            const float* log_probs_t = log_probs_b + (size_t)t * V;
+            for (int s = 0; s < S; ++s) {
+                int sym = ext[s];
+                float sum = alpha[(size_t)(t - 1) * S + s];
+                if (s - 1 >= 0) {
+                    float alt = alpha[(size_t)(t - 1) * S + (s - 1)];
+                    sum = cc_log_sum_exp_pair(sum, alt);
+                }
+                if (s - 2 >= 0 && sym != blank_index && ext[s] != ext[s - 2]) {
+                    float alt = alpha[(size_t)(t - 1) * S + (s - 2)];
+                    sum = cc_log_sum_exp_pair(sum, alt);
+                }
+                if (sym >= 0 && sym < V) {
+                    alpha[(size_t)t * S + s] = sum + log_probs_t[sym];
+                } else {
+                    alpha[(size_t)t * S + s] = log_zero;
+                }
+            }
+        }
+
+        beta[(size_t)(T_b - 1) * S + (S - 1)] = 0.0f;
+        if (S > 1) { beta[(size_t)(T_b - 1) * S + (S - 2)] = 0.0f; }
+
+        for (int t = T_b - 2; t >= 0; --t) {
+            const float* log_probs_next = log_probs_b + (size_t)(t + 1) * V;
+            for (int s = 0; s < S; ++s) {
+                int sym = ext[s];
+                float sum = log_zero;
+                if (sym >= 0 && sym < V) {
+                    float stay = beta[(size_t)(t + 1) * S + s];
+                    if (stay != log_zero) { sum = stay + log_probs_next[sym]; }
+                }
+                if (s + 1 < S) {
+                    int sym1 = ext[s + 1];
+                    float b1 = beta[(size_t)(t + 1) * S + (s + 1)];
+                    if (b1 != log_zero && sym1 >= 0 && sym1 < V) {
+                        float cand = b1 + log_probs_next[sym1];
+                        sum = cc_log_sum_exp_pair(sum, cand);
+                    }
+                }
+                if (s + 2 < S && sym != blank_index && ext[s + 2] != sym) {
+                    int sym2 = ext[s + 2];
+                    float b2 = beta[(size_t)(t + 1) * S + (s + 2)];
+                    if (b2 != log_zero && sym2 >= 0 && sym2 < V) {
+                        float cand = b2 + log_probs_next[sym2];
+                        sum = cc_log_sum_exp_pair(sum, cand);
+                    }
+                }
+                beta[(size_t)t * S + s] = sum;
+            }
+        }
+
+        float log_likelihood = alpha[(size_t)(T_b - 1) * S + (S - 1)];
+        if (S > 1) { log_likelihood = cc_log_sum_exp_pair(log_likelihood, alpha[(size_t)(T_b - 1) * S + (S - 2)]); }
+        loss_out[b] = -log_likelihood;
+
+        if (grad_out) {
+            float* grad_b = grad_out + (size_t)b * total_elements;
+            for (int t = 0; t < T; ++t) {
+                memset(grad_b + (size_t)t * V, 0, (size_t)V * sizeof(float));
+            }
+            for (int t = 0; t < T_b; ++t) {
+                float* posterior = (float*)calloc((size_t)V, sizeof(float));
+                if (!posterior) {
+                    fprintf(stderr, "[C] compute_ctc_loss_cpu: Error - Failed to allocate posterior buffer.\n");
+                    free(ext); free(alpha); free(beta);
+                    free(log_probs); free(probs);
+                    return 0;
+                }
+                for (int s = 0; s < S; ++s) {
+                    int sym = ext[s];
+                    if (sym < 0 || sym >= V) { continue; }
+                    float log_post = alpha[(size_t)t * S + s] + beta[(size_t)t * S + s] - log_likelihood;
+                    posterior[sym] += expf(log_post);
+                }
+                const float* prob_t = probs_b + (size_t)t * V;
+                float* grad_t = grad_b + (size_t)t * V;
+                for (int k = 0; k < V; ++k) {
+                    grad_t[k] = prob_t[k] - posterior[k];
+                }
+                free(posterior);
+            }
+        }
+
+        free(ext);
+        free(alpha);
+        free(beta);
+    }
+
+    free(log_probs);
+    free(probs);
+    return 1;
+}
+
 DLLEXPORT int execute_layernorm_on_gpu(int gpu_index, void* buffer_input, void* buffer_output, int num_rows, int row_size, float eps) {
     if (!buffer_input || !buffer_output) { fprintf(stderr, "[C] execute_layernorm_on_gpu: Error - NULL buffer handle provided.\n"); return 0; }
     if (num_rows <= 0 || row_size <= 0) { if (num_rows == 0) return 1; fprintf(stderr, "[C] execute_layernorm_on_gpu: Error - Invalid non-positive dimensions (rows=%d, size=%d).\n", num_rows, row_size); return 0; }
