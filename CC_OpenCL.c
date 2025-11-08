@@ -348,6 +348,7 @@ cl_kernel pairwise_similarity_kernel_fast = NULL;
 cl_program fused_diffusion_program = NULL;        cl_kernel fused_diffusion_kernel = NULL;
 cl_program fused_diffusion_program_fast = NULL;
 cl_kernel fused_diffusion_kernel_fast = NULL;
+static unsigned int g_rng_seed = 0; // Einfacher Zähler für den RNG-Seed
 cl_program hebbian_update_local_reduce_program = NULL; cl_kernel hebbian_update_local_reduce_kernel = NULL;
 cl_program hebbian_update_local_reduce_program_fast = NULL;
 cl_kernel hebbian_update_local_reduce_kernel_fast = NULL;
@@ -2398,39 +2399,72 @@ const char *pairwise_similarity_kernel_src =
 "}";
 
 const char *fused_diffusion_kernel_src =
-"/* Performs a diffusion update mixing self-activation with weighted neighbor contributions. */\n"
+"// Definiert M_PI, falls noch nicht vorhanden\n"
+"#ifndef M_PI\n"
+"#define M_PI 3.14159265358979323846f\n"
+"#endif\n"
+"\n"
+"// Einfacher und schneller Pseudo-Zufallszahlengenerator (Xorshift)\n"
+"inline uint xorshift_rng(uint state) {\n"
+"    state ^= state << 13;\n"
+"    state ^= state >> 17;\n"
+"    state ^= state << 5;\n"
+"    return state;\n"
+"}\n"
+"\n"
+"// Erzeugt eine normalverteilte Zufallszahl aus einer uniformen mittels Box-Muller-Transformation\n"
+"inline float random_normal(uint *seed) {\n"
+"    *seed = xorshift_rng(*seed);\n"
+"    // Konvertiert den uint-Zustand in einen float im Bereich (0, 1]\n"
+"    float u1 = (*seed) / 4294967296.0f + (1.0f / 8589934592.0f);\n"
+"    \n"
+"    *seed = xorshift_rng(*seed);\n"
+"    float u2 = (*seed) / 4294967296.0f + (1.0f / 8589934592.0f);\n"
+"    \n"
+"    // Box-Muller-Transformation\n"
+"    float mag = sqrt(-2.0f * log(u1));\n"
+"    return mag * cos(2.0f * M_PI * u2);\n"
+"}\n"
+"\n"
+"/* Führt den Fused-Diffusion-Schritt durch: O = (1-gamma)*X + gamma*(W@X) + noise*sigma */\n"
 "__kernel void fused_diffusion(\n"
-"    __global const FP_TYPE *X,  /* Input activations (B, N, D) */\n"
-"    __global const FP_TYPE *W,  /* Diffusion weights (B, N, N) */\n"
-"    __global FP_TYPE *O,        /* Output activations (B, N, D) */\n"
-"    const int B,\n"
-"    const int N,\n"
-"    const int D,\n"
-"    const FP_TYPE gamma,\n"
-"    const FP_TYPE sigma) {\n"
+"    __global const FP_TYPE *X,  /* Input state X [B, N, D] */\n"
+"    __global const FP_TYPE *W,  /* Weight matrix W [B, N, N] */\n"
+"    __global FP_TYPE *O,        /* Output state O [B, N, D] */\n"
+"    const int B, const int N, const int D,\n"
+"    const FP_TYPE gamma,        /* Mischfaktor */\n"
+"    const FP_TYPE sigma,        /* Rauschstärke */\n"
+"    const uint base_seed) {     /* Seed für den Zufallszahlengenerator */\n"
+"\n"
+"    // Jeder Work-Item berechnet ein Element im Output-Tensor O\n"
 "    int gid = get_global_id(0);\n"
 "    int total = B * N * D;\n"
-"    if (gid >= total) {\n"
-"        return;\n"
-"    }\n"
+"    if (gid >= total) return;\n"
 "\n"
-"    int d = gid % D;\n"
-"    int idx = gid / D;\n"
-"    int n = idx % N;\n"
-"    int b = idx / N;\n"
+"    // Dekodieren des globalen Index in Batch-, Knoten- und Dimensions-Indizes\n"
+"    const int d = gid % D;\n"
+"    const int idx_nd = gid / D;\n"
+"    const int n = idx_nd % N;\n"
+"    const int b = idx_nd / N;\n"
 "\n"
-"    int base_x = (b * N + n) * D + d;\n"
-"    FP_TYPE self_val = X[base_x];\n"
-"    FP_TYPE accum = (FP_TYPE)0;\n"
-"    int base_w = (b * N + n) * N;\n"
-"    int batch_offset = b * N;\n"
+"    // Berechne den gemischten Term (W @ X)\n"
+"    FP_TYPE mix = (FP_TYPE)0;\n"
+"    const size_t w_row_offset = ((size_t)b * N + n) * N;\n"
+"    const size_t x_batch_offset = (size_t)b * N * D;\n"
 "    for (int j = 0; j < N; ++j) {\n"
-"        FP_TYPE weight = W[base_w + j];\n"
-"        FP_TYPE neighbor = X[(batch_offset + j) * D + d];\n"
-"        accum += weight * neighbor;\n"
+"        mix += W[w_row_offset + j] * X[x_batch_offset + (size_t)j * D + d];\n"
 "    }\n"
 "\n"
-"    O[base_x] = gamma * self_val + sigma * accum;\n"
+"    const size_t x_idx = (size_t)b * N * D + (size_t)n * D + d;\n"
+"    const FP_TYPE self_val = X[x_idx];\n"
+"\n"
+"    // Erzeuge Rauschen\n"
+"    uint seed = base_seed + gid;\n"
+"    FP_TYPE noise = (sigma > 0.0f) ? random_normal(&seed) * sigma : 0.0f;\n"
+"\n"
+"    // Wende die finale Formel an\n"
+"    FP_TYPE one_minus_gamma = 1.0f - gamma;\n"
+"    O[x_idx] = one_minus_gamma * self_val + gamma * mix + noise;\n"
 "}\n";
 // GPU Prototype Update Kernel Sources
 const char *proto_segmented_sum_atomic_kernel_src =
@@ -8915,6 +8949,7 @@ int submit_kernel_command(int gpu_index, GPUCommand command, void *data) {
             cl_mem x_mem = (cl_mem)cmd->buffer_X;
             cl_mem w_mem = (cl_mem)cmd->buffer_W;
             cl_mem o_mem = (cl_mem)cmd->buffer_O;
+            unsigned int seed = (unsigned int)time(NULL) + g_rng_seed++;
             CHECK_CL_ERR(clSetKernelArg(kernel, 0, sizeof(cl_mem), &x_mem), "FusedDiffusion Arg 0 (X)");
             CHECK_CL_ERR(clSetKernelArg(kernel, 1, sizeof(cl_mem), &w_mem), "FusedDiffusion Arg 1 (W)");
             CHECK_CL_ERR(clSetKernelArg(kernel, 2, sizeof(cl_mem), &o_mem), "FusedDiffusion Arg 2 (O)");
@@ -8923,6 +8958,7 @@ int submit_kernel_command(int gpu_index, GPUCommand command, void *data) {
             CHECK_CL_ERR(clSetKernelArg(kernel, 5, sizeof(cl_int), &cmd->D), "FusedDiffusion Arg 5 (D)");
             CHECK_CL_ERR(clSetKernelArg(kernel, 6, sizeof(cl_float), &cmd->gamma), "FusedDiffusion Arg 6 (gamma)");
             CHECK_CL_ERR(clSetKernelArg(kernel, 7, sizeof(cl_float), &cmd->sigma), "FusedDiffusion Arg 7 (sigma)");
+            CHECK_CL_ERR(clSetKernelArg(kernel, 8, sizeof(cl_uint), &seed), "FusedDiffusion Arg 8 (seed)");
             size_t total = (size_t)cmd->B * (size_t)cmd->N * (size_t)cmd->D;
             if (total == 0) { return 1; }
             size_t gws[1] = { total };
@@ -9439,9 +9475,9 @@ DLLEXPORT int execute_shape_loss_with_reward_penalty_gpu(
 // Header / Sichtbarkeit
 DLLEXPORT int execute_fused_diffusion_on_gpu(
     int gpu_index,
-    void* buffer_X,  // float32 [B*N*D]
-    void* buffer_W,  // float32 [B*N*N]
-    void* buffer_O,  // float32 [B*N*D], Output
+    void* buffer_X,
+    void* buffer_W,
+    void* buffer_O,
     int B, int N, int D,
     float gamma, float sigma
 ) {
@@ -9450,14 +9486,54 @@ DLLEXPORT int execute_fused_diffusion_on_gpu(
         return 0;
     }
     if (B <= 0 || N <= 0 || D <= 0) {
-        if ((size_t)B * N * D == 0) { return 1; }
+        if ((size_t)B * N * D == 0) return 1;
         fprintf(stderr, "[C] execute_fused_diffusion_on_gpu: Error - Invalid non-positive dimensions (B=%d, N=%d, D=%d).\n", B, N, D);
         return 0;
     }
-    FusedDiffusionCommandData cmd_data = { buffer_X, buffer_W, buffer_O, B, N, D, gamma, sigma };
-    if (!submit_kernel_command(gpu_index, COMMAND_FUSED_DIFFUSION, &cmd_data)) {
+
+    // Wähle den schnellen Kernel, wenn verfügbar, sonst den Standard-Kernel
+    cl_kernel kernel = fused_diffusion_kernel_fast ? fused_diffusion_kernel_fast : fused_diffusion_kernel;
+    if (!kernel) {
+        fprintf(stderr, "[C] execute_fused_diffusion_on_gpu: Error - Fused diffusion kernel not compiled.\n");
         return 0;
     }
+
+    // Erzeuge einen Seed für den Zufallszahlengenerator
+    unsigned int seed = (unsigned int)time(NULL) + g_rng_seed++;
+
+    cl_mem x_mem = (cl_mem)buffer_X;
+    cl_mem w_mem = (cl_mem)buffer_W;
+    cl_mem o_mem = (cl_mem)buffer_O;
+    cl_int err = CL_SUCCESS;
+
+    // Setze alle Kernel-Argumente
+    err |= clSetKernelArg(kernel, 0, sizeof(cl_mem), &x_mem);
+    err |= clSetKernelArg(kernel, 1, sizeof(cl_mem), &w_mem);
+    err |= clSetKernelArg(kernel, 2, sizeof(cl_mem), &o_mem);
+    err |= clSetKernelArg(kernel, 3, sizeof(cl_int), &B);
+    err |= clSetKernelArg(kernel, 4, sizeof(cl_int), &N);
+    err |= clSetKernelArg(kernel, 5, sizeof(cl_int), &D);
+    err |= clSetKernelArg(kernel, 6, sizeof(cl_float), &gamma);
+    err |= clSetKernelArg(kernel, 7, sizeof(cl_float), &sigma);
+    err |= clSetKernelArg(kernel, 8, sizeof(cl_uint), &seed); // Das neue Seed-Argument
+
+    if (err != CL_SUCCESS) {
+        fprintf(stderr, "[C] FusedDiffusion: clSetKernelArg failed: %s (%d)\n", clGetErrorString(err), err);
+        return 0;
+    }
+
+    size_t total_elements = (size_t)B * N * D;
+    size_t gws[1] = { total_elements };
+
+    err = clEnqueueNDRangeKernel(queue, kernel, 1, NULL, gws, NULL, 0, NULL, NULL);
+    if (err != CL_SUCCESS) {
+        fprintf(stderr, "[C] FusedDiffusion: clEnqueueNDRangeKernel failed: %s (%d)\n", clGetErrorString(err), err);
+        return 0;
+    }
+
+    // Warten Sie auf die Fertigstellung (da die Python-Seite blockierend ist)
+    finish_queue_and_check(gpu_index, "execute_fused_diffusion_on_gpu");
+
     return 1;
 }
 
